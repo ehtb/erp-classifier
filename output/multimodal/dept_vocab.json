@@ -1,0 +1,18 @@
+{
+  "dept2id": {
+    "UNK": 0,
+    "ENG": 1,
+    "FACILITIES": 2,
+    "HR": 3,
+    "IT_OPS": 4,
+    "MARKETING": 5
+  },
+  "id2dept": {
+    "0": "UNK",
+    "1": "ENG",
+    "2": "FACILITIES",
+    "3": "HR",
+    "4": "IT_OPS",
+    "5": "MARKETING"
+  }
+}
