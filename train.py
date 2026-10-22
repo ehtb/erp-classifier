@@ -17,9 +17,11 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
 from pathlib import Path
 from typing import List, Dict
 from dataclasses import dataclass
+from collections import Counter
 
 from transformers import (
     AutoTokenizer,
@@ -30,6 +32,7 @@ from transformers import (
 )
 from transformers.trainer_utils import EvalPrediction
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.utils.class_weight import compute_class_weight
 from rich.console import Console
 
 from src.model import ERPClassifierModel
@@ -95,21 +98,54 @@ class MultimodalDataCollator:
         return batch
 
 
+def compute_class_weights(train_records: List[Dict], num_labels: int) -> torch.Tensor:
+    """
+    Safely compute balanced class weights even if a class has low/zero support.
+    """
+    labels = [r['label'] for r in train_records]
+    label_counts = Counter(labels)
+
+    console.print("\n📊 Class distribution in Train:")
+    for label_id in range(num_labels):
+        label_name = ID2LABEL.get(label_id, f"Label_{label_id}")
+        count = label_counts.get(label_id, 0)
+        console.print(f"  [{label_id}] {label_name}: {count} samples")
+
+    unique_classes = np.unique(labels)
+    computed = compute_class_weight(
+        class_weight='balanced',
+        classes=unique_classes,
+        y=labels,
+    )
+
+    weights = np.ones(num_labels, dtype=np.float32)
+    for cls_id, w in zip(unique_classes, computed):
+        # Cap extreme weights at 5.0 to prevent exploding gradients on tiny classes
+        weights[cls_id] = min(float(w), 5.0)
+
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 def compute_metrics(pred: EvalPrediction) -> Dict:
-    """Compute accuracy, precision, recall, F1."""
+    """Compute accuracy, macro F1 (for model selection), and weighted F1."""
     labels = pred.label_ids
-    preds = pred.predictions.argmax(-1)
+    preds = pred.predictions if isinstance(pred.predictions, np.ndarray) else pred.predictions[0]
+    preds = preds.argmax(-1)
 
     acc = accuracy_score(labels, preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(
+    w_prec, w_rec, w_f1, _ = precision_recall_fscore_support(
         labels, preds, average='weighted', zero_division=0
+    )
+    m_prec, m_rec, m_f1, _ = precision_recall_fscore_support(
+        labels, preds, average='macro', zero_division=0
     )
 
     return {
         'accuracy': acc,
-        'f1': f1,
-        'precision': precision,
-        'recall': recall,
+        'macro_f1': m_f1,       # Use this for metric_for_best_model
+        'weighted_f1': w_f1,
+        'macro_precision': m_prec,
+        'macro_recall': m_rec,
     }
 
 
@@ -145,10 +181,14 @@ def main():
     console.print(f"  Train: {len(train_dataset)} samples")
     console.print(f"  Val: {len(val_dataset)} samples")
 
-    # Count departments
+    # Safely count departments across both train and val (+2 buffer for test)
     train_records = train_dataset.records
-    num_depts = max(r['dept_id'] for r in train_records) + 1
-    console.print(f"  Departments: {num_depts} unique values")
+    all_records = train_dataset.records + val_dataset.records
+    num_depts = max(r['dept_id'] for r in all_records) + 2
+    console.print(f"  Departments embedding size: {num_depts}")
+
+    # Compute class weights to handle imbalance from Critic filter
+    class_weights = compute_class_weights(train_records, NUM_LABELS)
 
     # Create model
     console.print(f"\n🤖 Creating multimodal model...")
@@ -159,7 +199,8 @@ def main():
         config=config,
         model_name=args.model_name,
         num_depts=num_depts,
-        num_continuous=2,  # net_amount, log1p(net_amount)
+        num_continuous=2,  # z_score(net_amount), log1p(net_amount)
+        class_weights=class_weights,
     )
 
     console.print(f"  Architecture:")
@@ -188,18 +229,64 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         warmup_steps=warmup_steps,
+        lr_scheduler_type="cosine",
         weight_decay=0.01,
         logging_steps=20,
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
-        metric_for_best_model="f1",
+        metric_for_best_model="macro_f1",
         greater_is_better=True,
-        save_total_limit=3,
+        save_total_limit=2,
         report_to="none",
         fp16=torch.cuda.is_available(),
         push_to_hub=False,
+        remove_unused_columns=False,
     )
+
+    # Differential learning rates with no weight decay on bias / LayerNorm
+    def optimizer_factory(model):
+        no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "dept_norm.weight", "text_norm.weight"]
+
+        encoder_named = list(model.encoder.named_parameters())
+        encoder_ids = {id(p) for _, p in encoder_named}
+        tabular_named = [
+            (n, p) for n, p in model.named_parameters()
+            if id(p) not in encoder_ids and p.requires_grad
+        ]
+
+        optimizer_grouped_parameters = [
+            # 1. Encoder with weight decay
+            {
+                "params": [p for n, p in encoder_named if not any(nd in n for nd in no_decay)],
+                "lr": args.learning_rate,
+                "weight_decay": 0.01,
+            },
+            # 2. Encoder without weight decay (biases & LayerNorm)
+            {
+                "params": [p for n, p in encoder_named if any(nd in n for nd in no_decay)],
+                "lr": args.learning_rate,
+                "weight_decay": 0.0,
+            },
+            # 3. Tabular & Fusion heads with weight decay
+            {
+                "params": [p for n, p in tabular_named if not any(nd in n for nd in no_decay)],
+                "lr": 1e-3,
+                "weight_decay": 0.01,
+            },
+            # 4. Tabular & Fusion heads without weight decay (critical for threshold biases!)
+            {
+                "params": [p for n, p in tabular_named if any(nd in n for nd in no_decay)],
+                "lr": 1e-3,
+                "weight_decay": 0.0,
+            },
+        ]
+
+        console.print(f"\n⚙️  Differential learning rates configured:")
+        console.print(f"  Encoder (DistilBERT): {args.learning_rate}")
+        console.print("  Tabular & Fusion heads: 1e-3 (0.0 weight decay on threshold biases)")
+
+        return AdamW(optimizer_grouped_parameters)
 
     # Create trainer
     trainer = Trainer(
@@ -210,6 +297,7 @@ def main():
         data_collator=MultimodalDataCollator(),
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+        optimizers=(optimizer_factory(model), None),  # (optimizer, lr_scheduler)
     )
 
     # Train

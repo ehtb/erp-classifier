@@ -2,13 +2,14 @@
 Multimodal Tabular-Text ERP Classifier.
 
 Fuses text embeddings (vendor, description) with continuous numerical features
-(net_amount, log_amount) and categorical metadata (department) to learn
-GL account classification without hardcoded business rules.
+(z_score(net_amount), log1p(net_amount)) and categorical metadata (department)
+to learn GL account classification without hardcoded business rules.
 """
 
+from typing import Optional
 import torch
 import torch.nn as nn
-from transformers import AutoModel, PreTrainedModel
+from transformers import AutoConfig, AutoModel, PreTrainedModel
 from transformers.modeling_outputs import SequenceClassifierOutput
 
 
@@ -16,48 +17,54 @@ class ERPClassifierModel(PreTrainedModel):
     """
     Multimodal classifier that fuses:
     - Text: Vendor + Description (via DistilBERT)
-    - Continuous: net_amount, log1p(net_amount) → learns thresholds via backprop
-    - Categorical: department → embedding
-
-    This architecture allows the model to learn the 800 EUR capitalization
-    threshold natively without hardcoding it in the data preparation.
+    - Continuous: [z_score(net_amount), log1p(net_amount)] -> piecewise threshold MLP
+    - Categorical: department -> learned embedding
     """
 
-    def __init__(self, config, model_name: str = "distilbert-base-uncased",
-                 num_depts: int = 10, num_continuous: int = 2):
+    def __init__(
+        self,
+        config,
+        model_name: Optional[str] = None,
+        num_depts: Optional[int] = None,
+        num_continuous: Optional[int] = None,
+        class_weights: Optional[torch.Tensor] = None,
+    ):
         super().__init__(config)
 
+        # Persist hyperparameters in config so save_pretrained / from_pretrained works
+        self.model_name = model_name or getattr(config, "base_model_name", "distilbert-base-uncased")
+        self.num_depts = num_depts or getattr(config, "num_depts", 10)
+        self.num_continuous = num_continuous or getattr(config, "num_continuous", 2)
         self.num_labels = config.num_labels
-        self.config = config
 
-        # Text encoder (DistilBERT)
-        self.encoder = AutoModel.from_pretrained(model_name)
+        config.base_model_name = self.model_name
+        config.num_depts = self.num_depts
+        config.num_continuous = self.num_continuous
+
+        # 1. Text encoder branch
+        self.encoder = AutoModel.from_pretrained(self.model_name)
         hidden_size = self.encoder.config.hidden_size  # 768 for DistilBERT
+        self.text_norm = nn.LayerNorm(hidden_size)
 
-        # Continuous numerical projection branch
-        # Learns to recognize thresholds (800 EUR), ranges, and amount patterns
+        # 2. Continuous numerical projection branch
+        # Crucial: Do NOT put LayerNorm before the first GELU, otherwise collinear
+        # 2D projections have their magnitude normalized away before threshold activation.
         self.num_proj = nn.Sequential(
-            nn.Linear(num_continuous, 64),
-            nn.LayerNorm(64),
+            nn.Linear(self.num_continuous, 64),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(64, 64),
-            nn.LayerNorm(64),
             nn.GELU(),
+            nn.LayerNorm(64),
         )
 
-        # Categorical department embedding branch
-        # Captures department-specific patterns (IT_OPS vs MARKETING)
-        self.dept_emb = nn.Embedding(num_depts, 32, padding_idx=0)  # 0 = UNK
-        self.dept_norm = nn.LayerNorm(32)
+        # 3. Categorical department embedding branch (index 0 = UNK, trainable)
+        self.dept_emb = nn.Embedding(self.num_depts, 32)
         self.dept_act = nn.GELU()
+        self.dept_norm = nn.LayerNorm(32)
 
-        # Text normalization
-        self.text_norm = nn.LayerNorm(hidden_size)
-
-        # Joint interaction classification head
-        # Fuses all modalities to make final decision
-        combined_dim = hidden_size + 64 + 32  # 768 + 64 + 32 = 864
+        # 4. Joint interaction classification head
+        combined_dim = hidden_size + 64 + 32  # 864
         self.classifier = nn.Sequential(
             nn.Linear(combined_dim, 256),
             nn.LayerNorm(256),
@@ -66,75 +73,56 @@ class ERPClassifierModel(PreTrainedModel):
             nn.Linear(256, 128),
             nn.LayerNorm(128),
             nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, self.num_labels)
+            nn.Dropout(0.1),
+            nn.Linear(128, self.num_labels),
         )
 
-        # Initialize weights
-        self._init_weights()
+        # Register class_weights as a buffer so it moves to GPU/MPS automatically
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights.float())
+        else:
+            self.register_buffer("class_weights", None)
 
-    def _init_weights(self):
-        """Initialize new layers with small random weights."""
+        self._init_custom_heads()
+
+    def _init_custom_heads(self):
+        """Initialize non-pretrained tabular and classifier layers."""
         for module in [self.num_proj, self.classifier]:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-        # Initialize department embeddings
         nn.init.normal_(self.dept_emb.weight, mean=0.0, std=0.02)
-        if self.dept_emb.padding_idx is not None:
-            with torch.no_grad():
-                self.dept_emb.weight[self.dept_emb.padding_idx].fill_(0)
 
     def forward(
         self,
-        input_ids,
-        attention_mask,
-        num_features,
-        dept_id,
-        labels=None,
-        return_dict=True,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_features: torch.Tensor,
+        dept_id: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
     ):
-        """
-        Forward pass with multimodal fusion.
-
-        Args:
-            input_ids: [B, seq_len] - Tokenized text (vendor + description)
-            attention_mask: [B, seq_len] - Attention mask
-            num_features: [B, 2] - [net_amount, log1p(net_amount)]
-            dept_id: [B] - Department integer index
-            labels: [B] - Ground truth GL account labels
-            return_dict: Whether to return SequenceClassifierOutput
-
-        Returns:
-            SequenceClassifierOutput with loss and logits
-        """
-        # Text branch: Encode vendor + description
+        # Text branch: [B, 768]
         text_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        cls_vec = self.text_norm(text_out.last_hidden_state[:, 0, :])  # [B, 768]
+        cls_vec = self.text_norm(text_out.last_hidden_state[:, 0, :])
 
-        # Continuous branch: Project numerical features
-        # The network learns to recognize thresholds, not us hardcoding them
-        num_vec = self.num_proj(num_features)  # [B, 64]
+        # Continuous branch: ensure float32 [B, 2] -> [B, 64]
+        num_vec = self.num_proj(num_features.float())
 
-        # Categorical branch: Embed department
-        dept_vec = self.dept_emb(dept_id)      # [B, 32]
-        dept_vec = self.dept_norm(dept_vec)
-        dept_vec = self.dept_act(dept_vec)
+        # Categorical branch: ensure long [B] -> [B, 32]
+        dept_vec = self.dept_norm(self.dept_act(self.dept_emb(dept_id.long())))
 
-        # Fusion: Concatenate all modalities
-        fused = torch.cat([cls_vec, num_vec, dept_vec], dim=-1)  # [B, 864]
+        # Multimodal fusion: [B, 864] -> [B, num_labels]
+        fused = torch.cat([cls_vec, num_vec, dept_vec], dim=-1)
+        logits = self.classifier(fused)
 
-        # Classification
-        logits = self.classifier(fused)  # [B, num_labels]
-
-        # Compute loss if labels provided
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1).long())
 
         if not return_dict:
             output = (logits,) + text_out[2:]
