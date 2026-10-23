@@ -1,477 +1,313 @@
 """
-Evaluation script for ERP GL account classifier.
+Evaluation script with error analysis and confidence calibration.
 
 Provides:
-1. Classification report
-2. Confusion matrix
-3. Counterfactual accuracy (price flips, department flips)
-4. Single-sample inference latency
+1. Confusion matrix (8x8)
+2. Per-class metrics
+3. Misclassified samples with confidence scores
+4. Confidence-based accuracy/coverage curves for production routing
 """
 
+import argparse
 import json
-import time
+import numpy as np
+import torch
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 from collections import defaultdict
 
-import torch
-import numpy as np
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer
 from sklearn.metrics import (
-    classification_report,
     confusion_matrix,
+    classification_report,
     accuracy_score,
+    precision_recall_fscore_support,
 )
-import matplotlib.pyplot as plt
-import seaborn as sns
 from rich.console import Console
 from rich.table import Table
+from torch.utils.data import DataLoader
 
-from .config import LABEL2ID, ID2LABEL, NUM_LABELS
+from src.model import ERPClassifierModel
+from src.config import NUM_LABELS, ID2LABEL, LABEL2ID
 
 console = Console()
 
 
+class ERPEvalDataset(torch.utils.data.Dataset):
+    """Minimal evaluation dataset."""
 
-class GLClassifier:
-    """Wrapper for trained GL account classifier."""
+    def __init__(self, jsonl_path: Path, tokenizer, max_length: int = 128):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.records = []
 
-    def __init__(self, model_path: Path, device: str = None):
-        """
-        Initialize classifier.
+        with open(jsonl_path) as f:
+            for line in f:
+                record = json.loads(line)
+                record["num_features"] = np.array(record["num_features"], dtype=np.float32)
+                self.records.append(record)
 
-        Args:
-            model_path: Path to saved model directory
-            device: Device to use (cuda/cpu, auto-detected if None)
-        """
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    def __len__(self):
+        return len(self.records)
 
-        console.print(f"🤖 Loading model from {model_path}")
-        console.print(f"   Device: {self.device}")
+    def __getitem__(self, idx):
+        record = self.records[idx]
 
-        self.tokenizer = AutoTokenizer.from_pretrained(str(model_path))
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            str(model_path),
-            num_labels=NUM_LABELS,
-            ignore_mismatched_sizes=True  # For LoRA adapters
-        )
-        self.model.to(self.device)
-        self.model.eval()
-
-    def predict(self, text: str) -> Tuple[str, float, Dict[str, float]]:
-        """
-        Predict GL account for a single text.
-
-        Returns:
-            (predicted_label, confidence, all_probabilities)
-        """
         encoding = self.tokenizer(
-            text,
+            record["text"],
             truncation=True,
-            padding=True,
-            max_length=128,
-            return_tensors='pt',
-        ).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(**encoding)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1)
-
-        pred_idx = torch.argmax(probs, dim=-1).item()
-        confidence = probs[0, pred_idx].item()
-
-        predicted_label = ID2LABEL[pred_idx]
-
-        # Get all probabilities
-        all_probs = {
-            ID2LABEL[i]: probs[0, i].item()
-            for i in range(NUM_LABELS)
-        }
-
-        return predicted_label, confidence, all_probs
-
-    def predict_batch(self, texts: List[str], batch_size: int = 32) -> List[Tuple[str, float]]:
-        """
-        Predict GL accounts for a batch of texts.
-
-        Returns:
-            List of (predicted_label, confidence) tuples
-        """
-        predictions = []
-
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-
-            encoding = self.tokenizer(
-                batch_texts,
-                truncation=True,
-                padding=True,
-                max_length=128,
-                return_tensors='pt',
-            ).to(self.device)
-
-            with torch.no_grad():
-                outputs = self.model(**encoding)
-                logits = outputs.logits
-                probs = torch.softmax(logits, dim=-1)
-
-            pred_indices = torch.argmax(probs, dim=-1).cpu().numpy()
-            confidences = probs[range(len(batch_texts)), pred_indices].cpu().numpy()
-
-            for pred_idx, conf in zip(pred_indices, confidences):
-                predictions.append((ID2LABEL[pred_idx], float(conf)))
-
-        return predictions
-
-    def measure_latency(self, text: str, num_runs: int = 100) -> Dict[str, float]:
-        """Measure single-sample inference latency."""
-        # Warmup
-        for _ in range(10):
-            self.predict(text)
-
-        # Measure
-        latencies = []
-        for _ in range(num_runs):
-            start = time.perf_counter()
-            self.predict(text)
-            latencies.append((time.perf_counter() - start) * 1000)  # Convert to ms
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
 
         return {
-            "mean_ms": np.mean(latencies),
-            "std_ms": np.std(latencies),
-            "min_ms": np.min(latencies),
-            "max_ms": np.max(latencies),
-            "p50_ms": np.percentile(latencies, 50),
-            "p95_ms": np.percentile(latencies, 95),
-            "p99_ms": np.percentile(latencies, 99),
+            "input_ids": encoding["input_ids"].squeeze(0),
+            "attention_mask": encoding["attention_mask"].squeeze(0),
+            "num_features": torch.tensor(record["num_features"], dtype=torch.float32),
+            "dept_id": torch.tensor(record["dept_id"], dtype=torch.long),
+            "labels": torch.tensor(record["label"], dtype=torch.long),
+            "text": record["text"],
+            "net_amount": record.get("net_amount", 0.0),
+            "dept_name": record.get("dept_name", "UNKNOWN"),
         }
 
 
-def evaluate_standard(
-    classifier: GLClassifier,
-    test_records: List[dict],
-    output_dir: Path,
-) -> Dict:
+def collate_fn(batch):
+    """Custom collator preserving metadata."""
+    return {
+        "input_ids": torch.stack([x["input_ids"] for x in batch]),
+        "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
+        "num_features": torch.stack([x["num_features"] for x in batch]),
+        "dept_id": torch.stack([x["dept_id"] for x in batch]),
+        "labels": torch.stack([x["labels"] for x in batch]),
+        "text": [x["text"] for x in batch],
+        "net_amount": [x["net_amount"] for x in batch],
+        "dept_name": [x["dept_name"] for x in batch],
+    }
+
+
+def evaluate_model(
+    model: ERPClassifierModel,
+    dataloader: DataLoader,
+    device: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict]]:
     """
-    Evaluate on standard test set.
+    Run inference and collect predictions, confidences, and metadata.
 
-    Returns metrics dict.
+    Returns:
+        (true_labels, pred_labels, confidences, samples)
     """
-    console.print(f"\n📊 Evaluating on {len(test_records)} test records...")
+    model.eval()
+    all_labels = []
+    all_preds = []
+    all_confs = []
+    all_samples = []
 
-    # Predict
-    texts = [r['text'] for r in test_records]
-    # Convert integer labels to strings (HuggingFace datasets store labels as ClassLabel ints)
-    true_labels = [ID2LABEL[r['label']] if isinstance(r['label'], int) else r['label']
-                   for r in test_records]
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            num_features = batch["num_features"].to(device)
+            dept_id = batch["dept_id"].to(device)
+            labels = batch["labels"].to(device)
 
-    predictions = classifier.predict_batch(texts)
-    pred_labels = [p[0] for p in predictions]
-    confidences = [p[1] for p in predictions]
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                num_features=num_features,
+                dept_id=dept_id,
+                return_dict=True,
+            )
 
-    # Compute metrics
-    accuracy = accuracy_score(true_labels, pred_labels)
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=-1)
+            confs, preds = torch.max(probs, dim=-1)
 
-    # Classification report
-    report = classification_report(
-        true_labels,
-        pred_labels,
-        target_names=sorted(set(true_labels)),
-        output_dict=True,
-        zero_division=0,
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_confs.extend(confs.cpu().numpy())
+
+            # Store samples with metadata
+            for i in range(len(labels)):
+                all_samples.append(
+                    {
+                        "text": batch["text"][i],
+                        "net_amount": batch["net_amount"][i],
+                        "dept_name": batch["dept_name"][i],
+                        "true_label": int(labels[i].cpu()),
+                        "pred_label": int(preds[i].cpu()),
+                        "confidence": float(confs[i].cpu()),
+                    }
+                )
+
+    return (
+        np.array(all_labels),
+        np.array(all_preds),
+        np.array(all_confs),
+        all_samples,
     )
 
-    console.print(f"\n[bold cyan]Classification Report:[/bold cyan]")
-    console.print(f"  Accuracy: {accuracy:.4f}")
-    console.print(f"  Weighted F1: {report['weighted avg']['f1-score']:.4f}")
 
-    # Print per-class metrics
-    table = Table(title="Per-Class Metrics", show_header=True)
-    table.add_column("GL Account", style="cyan")
-    table.add_column("Precision", justify="right", style="green")
-    table.add_column("Recall", justify="right", style="yellow")
-    table.add_column("F1", justify="right", style="magenta")
-    table.add_column("Support", justify="right")
+def print_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray):
+    """Print 8x8 confusion matrix with rich table."""
+    cm = confusion_matrix(y_true, y_pred, labels=range(NUM_LABELS))
 
-    for gl_account in sorted(set(true_labels)):
-        if gl_account in report:
-            metrics = report[gl_account]
-            table.add_row(
-                gl_account,
-                f"{metrics['precision']:.3f}",
-                f"{metrics['recall']:.3f}",
-                f"{metrics['f1-score']:.3f}",
-                str(int(metrics['support'])),
-            )
+    table = Table(title="Confusion Matrix (Rows=True, Cols=Pred)")
+    table.add_column("True \\ Pred", style="cyan")
+    for i in range(NUM_LABELS):
+        short_label = ID2LABEL[i].replace("GL_", "").replace("_", " ")[:12]
+        table.add_column(short_label, justify="right")
+
+    for i in range(NUM_LABELS):
+        row_label = ID2LABEL[i].replace("GL_", "").replace("_", " ")[:12]
+        row = [row_label] + [str(cm[i, j]) if cm[i, j] > 0 else "·" for j in range(NUM_LABELS)]
+        table.add_row(*row)
 
     console.print(table)
 
-    # Confusion matrix
-    cm = confusion_matrix(true_labels, pred_labels, labels=sorted(set(true_labels)))
 
-    # Plot confusion matrix
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        xticklabels=[gl.replace('GL_', '') for gl in sorted(set(true_labels))],
-        yticklabels=[gl.replace('GL_', '') for gl in sorted(set(true_labels))],
-    )
-    plt.title('Confusion Matrix')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.xticks(rotation=45, ha='right')
-    plt.yticks(rotation=0)
-    plt.tight_layout()
+def analyze_errors(samples: List[Dict]):
+    """Print all misclassified samples."""
+    errors = [s for s in samples if s["true_label"] != s["pred_label"]]
 
-    cm_path = output_dir / "confusion_matrix.png"
-    plt.savefig(cm_path, dpi=300, bbox_inches='tight')
-    console.print(f"\n💾 Saved confusion matrix to {cm_path}")
+    if not errors:
+        console.print("\n[green]✓ No errors! Perfect classification.[/green]")
+        return
 
-    # Save detailed results
-    results_path = output_dir / "test_results.jsonl"
-    with open(results_path, 'w') as f:
-        for record, pred_label, conf in zip(test_records, pred_labels, confidences):
-            result = {
-                "text": record['text'],
-                "true_label": record['label'],
-                "predicted_label": pred_label,
-                "confidence": conf,
-                "correct": pred_label == record['label'],
-                "metadata": record.get('metadata', {}),
-            }
-            f.write(json.dumps(result) + '\n')
+    console.print(f"\n[yellow]Misclassified Samples: {len(errors)}[/yellow]\n")
 
-    console.print(f"💾 Saved detailed results to {results_path}")
+    table = Table()
+    table.add_column("True", style="green")
+    table.add_column("Pred", style="red")
+    table.add_column("Conf", justify="right")
+    table.add_column("Amount", justify="right")
+    table.add_column("Dept", style="cyan")
+    table.add_column("Text", overflow="fold", max_width=50)
 
-    return {
-        "accuracy": accuracy,
-        "weighted_f1": report['weighted avg']['f1-score'],
-        "classification_report": report,
-    }
+    for err in errors:
+        table.add_row(
+            ID2LABEL[err["true_label"]].replace("GL_", "")[:20],
+            ID2LABEL[err["pred_label"]].replace("GL_", "")[:20],
+            f"{err['confidence']:.3f}",
+            f"€{err['net_amount']:.0f}",
+            err["dept_name"][:15],
+            err["text"][:80],
+        )
+
+    console.print(table)
 
 
-def evaluate_counterfactuals(
-    classifier: GLClassifier,
-    counterfactual_records: List[dict],
-    output_dir: Path,
+def compute_confidence_curve(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    confidences: np.ndarray,
+    thresholds: List[float] = [0.50, 0.70, 0.80, 0.90, 0.95],
 ) -> Dict:
     """
-    Evaluate counterfactual robustness.
+    Compute accuracy and coverage at different confidence thresholds.
 
-    Tests if model correctly handles:
-    1. Price flips around 800 EUR threshold
-    2. Department flips for same item
+    For production ERP automation: samples below threshold route to MANUAL_REVIEW.
     """
-    console.print(f"\n🔄 Evaluating {len(counterfactual_records)} counterfactual records...")
+    results = {}
 
-    # Group by pair_id
-    pairs = defaultdict(list)
-    for record in counterfactual_records:
-        pair_id = record.get('pair_id')
-        if pair_id is not None:
-            pairs[pair_id].append(record)
+    for thresh in thresholds:
+        mask = confidences >= thresh
+        coverage = mask.sum() / len(y_true)
 
-    # Predict for all records
-    texts = [r['text'] for r in counterfactual_records]
-    predictions = classifier.predict_batch(texts)
+        if mask.sum() > 0:
+            acc = accuracy_score(y_true[mask], y_pred[mask])
+        else:
+            acc = 0.0
 
-    # Add predictions to records
-    for record, (pred_label, conf) in zip(counterfactual_records, predictions):
-        record['predicted_label'] = pred_label
-        record['confidence'] = conf
-        record['correct'] = pred_label == record['label']
+        results[thresh] = {"accuracy": acc, "coverage": coverage, "count": int(mask.sum())}
 
-    # Analyze pairs
-    price_flip_correct = 0
-    dept_flip_correct = 0
-    total_price_flips = 0
-    total_dept_flips = 0
+    return results
 
-    pair_results = []
 
-    for pair_id, pair_records in pairs.items():
-        if len(pair_records) != 2:
-            continue
+def print_confidence_analysis(conf_results: Dict):
+    """Print confidence-based routing table."""
+    table = Table(title="Confidence-Based Routing (Auto-Post vs Manual Review)")
+    table.add_column("Threshold", justify="right")
+    table.add_column("Accuracy", justify="right")
+    table.add_column("Coverage", justify="right")
+    table.add_column("Count", justify="right")
+    table.add_column("Recommendation", style="bold")
 
-        low, high = pair_records[0], pair_records[1]
-        if low.get('pair_position') == 'high':
-            low, high = high, low
+    for thresh, res in sorted(conf_results.items()):
+        rec = "✓ Auto-post" if res["accuracy"] >= 0.98 else "⚠ Review needed"
+        color = "green" if res["accuracy"] >= 0.98 else "yellow"
 
-        # Determine flip type based on metadata
-        low_meta = low.get('metadata', {})
-        high_meta = high.get('metadata', {})
-
-        is_price_flip = (
-            low_meta.get('base_category') == 'IT_HARDWARE' and
-            high_meta.get('base_category') == 'IT_HARDWARE' and
-            low_meta.get('department') == high_meta.get('department')
+        table.add_row(
+            f"{thresh:.2f}",
+            f"[{color}]{res['accuracy']:.4f}[/{color}]",
+            f"{res['coverage']:.2%}",
+            str(res["count"]),
+            rec,
         )
 
-        is_dept_flip = (
-            low_meta.get('department') != high_meta.get('department') and
-            low_meta.get('net_amount_eur') == high_meta.get('net_amount_eur')
-        )
-
-        both_correct = low['correct'] and high['correct']
-
-        pair_result = {
-            'pair_id': pair_id,
-            'is_price_flip': is_price_flip,
-            'is_dept_flip': is_dept_flip,
-            'both_correct': both_correct,
-            'low': {
-                'text': low['text'],
-                'true_label': low['label'],
-                'predicted_label': low['predicted_label'],
-                'correct': low['correct'],
-            },
-            'high': {
-                'text': high['text'],
-                'true_label': high['label'],
-                'predicted_label': high['predicted_label'],
-                'correct': high['correct'],
-            },
-        }
-
-        pair_results.append(pair_result)
-
-        if is_price_flip:
-            total_price_flips += 1
-            if both_correct:
-                price_flip_correct += 1
-
-        if is_dept_flip:
-            total_dept_flips += 1
-            if both_correct:
-                dept_flip_correct += 1
-
-    # Print results
-    console.print(f"\n[bold cyan]Counterfactual Results:[/bold cyan]")
-
-    if total_price_flips > 0:
-        price_flip_acc = price_flip_correct / total_price_flips
-        console.print(f"  Price flip pairs (800 EUR threshold): {price_flip_correct}/{total_price_flips} ({price_flip_acc:.1%})")
-
-    if total_dept_flips > 0:
-        dept_flip_acc = dept_flip_correct / total_dept_flips
-        console.print(f"  Department flip pairs: {dept_flip_correct}/{total_dept_flips} ({dept_flip_acc:.1%})")
-
-    # Save results
-    results_path = output_dir / "counterfactual_results.json"
-    with open(results_path, 'w') as f:
-        json.dump({
-            'price_flip_accuracy': price_flip_correct / total_price_flips if total_price_flips > 0 else None,
-            'dept_flip_accuracy': dept_flip_correct / total_dept_flips if total_dept_flips > 0 else None,
-            'total_price_flips': total_price_flips,
-            'total_dept_flips': total_dept_flips,
-            'pair_results': pair_results,
-        }, f, indent=2)
-
-    console.print(f"💾 Saved counterfactual results to {results_path}")
-
-    return {
-        'price_flip_accuracy': price_flip_correct / total_price_flips if total_price_flips > 0 else None,
-        'dept_flip_accuracy': dept_flip_correct / total_dept_flips if total_dept_flips > 0 else None,
-    }
+    console.print(table)
 
 
 def main():
-    """CLI entry point."""
-    import argparse
-    from datasets import load_from_disk
-
-    parser = argparse.ArgumentParser(description="Evaluate GL account classifier")
-    parser.add_argument(
-        "--model-dir",
-        type=str,
-        required=True,
-        help="Directory with trained model",
-    )
-    parser.add_argument(
-        "--data-path",
-        type=str,
-        required=True,
-        help="Path to HuggingFace dataset directory (must contain a 'test' split)",
-    )
-    parser.add_argument(
-        "--counterfactuals",
-        type=str,
-        help="Path to HuggingFace counterfactual dataset directory",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        help="Output directory for evaluation results (defaults to model-dir/eval)",
-    )
-    parser.add_argument(
-        "--measure-latency",
-        action="store_true",
-        help="Measure single-sample inference latency",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-dir", type=str, required=True)
+    parser.add_argument("--data", type=str, required=True, help="JSONL data file")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--device", type=str, default="mps" if torch.backends.mps.is_available() else "cpu")
 
     args = parser.parse_args()
 
-    model_path = Path(args.model_dir)
-    output_dir = Path(args.output_dir) if args.output_dir else model_path / "eval"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    console.print(f"\n[bold]Evaluating ERP Classifier[/bold]")
+    console.print(f"  Model: {args.model_dir}")
+    console.print(f"  Data: {args.data}")
+    console.print(f"  Device: {args.device}")
 
-    # Load classifier
-    classifier = GLClassifier(model_path)
+    # Load model and tokenizer
+    model = ERPClassifierModel.from_pretrained(args.model_dir)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
 
-    # Evaluate on test split
-    test_records = []
-    test_metrics = {}
-    dataset_dict = load_from_disk(args.data_path)
-    if "test" in dataset_dict:
-        test_records = list(dataset_dict["test"])
-        test_metrics = evaluate_standard(classifier, test_records, output_dir)
-    else:
-        console.print(f"[yellow]Warning: no 'test' split in {args.data_path}, skipping standard evaluation[/yellow]")
+    model.to(args.device)
+    model.eval()
 
-    # Evaluate on counterfactuals
-    counterfactual_metrics = {}
-    if args.counterfactuals:
-        cf_dataset = load_from_disk(args.counterfactuals)
-        # Counterfactuals are saved as a plain Dataset, not a DatasetDict
-        cf_records = list(cf_dataset) if hasattr(cf_dataset, '__iter__') else []
-        if cf_records:
-            counterfactual_metrics = evaluate_counterfactuals(classifier, cf_records, output_dir)
-        else:
-            console.print(f"[yellow]Warning: counterfactual dataset at {args.counterfactuals} is empty[/yellow]")
+    # Load data
+    dataset = ERPEvalDataset(Path(args.data), tokenizer)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_fn)
 
-    # Measure latency
-    if args.measure_latency and test_records:
-        console.print(f"\n⏱️  Measuring inference latency...")
-        sample_text = test_records[0]['text']
-        latency_stats = classifier.measure_latency(sample_text)
+    console.print(f"  Samples: {len(dataset)}\n")
 
-        console.print(f"\n[bold cyan]Latency Statistics (100 runs):[/bold cyan]")
-        console.print(f"  Mean: {latency_stats['mean_ms']:.2f} ms")
-        console.print(f"  Std:  {latency_stats['std_ms']:.2f} ms")
-        console.print(f"  P50:  {latency_stats['p50_ms']:.2f} ms")
-        console.print(f"  P95:  {latency_stats['p95_ms']:.2f} ms")
-        console.print(f"  P99:  {latency_stats['p99_ms']:.2f} ms")
+    # Run evaluation
+    y_true, y_pred, confidences, samples = evaluate_model(model, dataloader, args.device)
 
-        latency_path = output_dir / "latency_stats.json"
-        with open(latency_path, 'w') as f:
-            json.dump(latency_stats, f, indent=2)
+    # Overall metrics
+    acc = accuracy_score(y_true, y_pred)
+    macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
+    )
 
-    # Save summary
-    summary = {
-        'test_metrics': test_metrics,
-        'counterfactual_metrics': counterfactual_metrics,
-    }
+    console.print(f"[bold green]Overall Metrics[/bold green]")
+    console.print(f"  Accuracy: {acc:.4f}")
+    console.print(f"  Macro F1: {macro_f1:.4f}")
+    console.print(f"  Macro Precision: {macro_p:.4f}")
+    console.print(f"  Macro Recall: {macro_r:.4f}\n")
 
-    summary_path = output_dir / "evaluation_summary.json"
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
+    # Per-class report
+    console.print("[bold]Per-Class Metrics[/bold]")
+    report = classification_report(y_true, y_pred, target_names=[ID2LABEL[i] for i in range(NUM_LABELS)])
+    console.print(report)
 
-    console.print(f"\n💾 Saved evaluation summary to {summary_path}")
-    console.print(f"\n[bold green]✓ Evaluation complete![/bold green]")
+    # Confusion matrix
+    print_confusion_matrix(y_true, y_pred)
+
+    # Error analysis
+    analyze_errors(samples)
+
+    # Confidence calibration
+    console.print("\n[bold cyan]Confidence Calibration for Production Routing[/bold cyan]")
+    conf_results = compute_confidence_curve(y_true, y_pred, confidences)
+    print_confidence_analysis(conf_results)
+
+    console.print(f"\n[green]✓ Evaluation complete![/green]")
 
 
 if __name__ == "__main__":

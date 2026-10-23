@@ -155,9 +155,10 @@ def main():
     parser.add_argument("--val-data", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="models/multimodal-classifier")
     parser.add_argument("--model-name", type=str, default="distilbert-base-uncased")
-    parser.add_argument("--num-epochs", type=int, default=15)
+    parser.add_argument("--num-epochs", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=3e-5)
+    parser.add_argument("--tabular-lr", type=float, default=5e-4)
     parser.add_argument("--max-length", type=int, default=128)
 
     args = parser.parse_args()
@@ -218,9 +219,9 @@ def main():
     # Training arguments
     output_dir = Path(args.output_dir)
 
-    # Calculate warmup steps (10% of total training steps)
+    # Calculate warmup steps (15% of total training steps for smoother annealing)
     total_steps = (len(train_dataset) // args.batch_size) * args.num_epochs
-    warmup_steps = int(total_steps * 0.1)
+    warmup_steps = int(total_steps * 0.15)
 
     training_args = TrainingArguments(
         output_dir=str(output_dir),
@@ -271,20 +272,20 @@ def main():
             # 3. Tabular & Fusion heads with weight decay
             {
                 "params": [p for n, p in tabular_named if not any(nd in n for nd in no_decay)],
-                "lr": 1e-3,
+                "lr": args.tabular_lr,
                 "weight_decay": 0.01,
             },
             # 4. Tabular & Fusion heads without weight decay (critical for threshold biases!)
             {
                 "params": [p for n, p in tabular_named if any(nd in n for nd in no_decay)],
-                "lr": 1e-3,
+                "lr": args.tabular_lr,
                 "weight_decay": 0.0,
             },
         ]
 
         console.print(f"\n⚙️  Differential learning rates configured:")
         console.print(f"  Encoder (DistilBERT): {args.learning_rate}")
-        console.print("  Tabular & Fusion heads: 1e-3 (0.0 weight decay on threshold biases)")
+        console.print(f"  Tabular & Fusion heads: {args.tabular_lr} (0.0 weight decay on threshold biases)")
 
         return AdamW(optimizer_grouped_parameters)
 

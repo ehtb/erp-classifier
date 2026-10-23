@@ -40,7 +40,7 @@ console = Console()
 class ERPClassifier:
     """Classifier with loaded model and artifacts."""
 
-    def __init__(self, model_dir: str = "models/multimodal-classifier"):
+    def __init__(self, model_dir: str = "models/multimodal-v2"):
         self.model_dir = Path(model_dir)
         self.model = None
         self.tokenizer = None
@@ -57,7 +57,13 @@ class ERPClassifier:
 
         if not self.model_dir.exists():
             console.print(f"[red]Error: Model directory not found: {self.model_dir}[/red]")
-            console.print(f"[yellow]Run this first:[/yellow] python train_multimodal.py")
+            console.print(f"[yellow]Available models:[/yellow]")
+            models_dir = Path("models")
+            if models_dir.exists():
+                for model_path in models_dir.iterdir():
+                    if model_path.is_dir():
+                        console.print(f"  - {model_path}")
+            console.print(f"\n[yellow]Or train a new model:[/yellow] python train.py --output-dir {self.model_dir}")
             sys.exit(1)
 
         # Load tokenizer
@@ -68,7 +74,7 @@ class ERPClassifier:
         scaler_path = Path("output/multimodal/scaler.json")
         if not scaler_path.exists():
             console.print(f"[red]Error: Scaler not found: {scaler_path}[/red]")
-            console.print(f"[yellow]Run this first:[/yellow] python build_multimodal_dataset.py")
+            console.print(f"[yellow]Generate data first:[/yellow] python build_multimodal_dataset.py")
             sys.exit(1)
 
         with open(scaler_path) as f:
@@ -87,23 +93,9 @@ class ERPClassifier:
             self.dept_vocab = vocab_data['dept2id']
             self.id2dept = {int(k): v for k, v in vocab_data['id2dept'].items()}
 
-        # Load model
+        # Load model using from_pretrained (handles architecture automatically)
         with console.status("[bold green]Loading model weights..."):
-            config = AutoConfig.from_pretrained(self.model_dir)
-            self.model = ERPClassifierModel(
-                config=config,
-                model_name="distilbert-base-uncased",
-                num_depts=len(self.dept_vocab),
-                num_continuous=2,
-            )
-
-            # Load weights
-            model_path = self.model_dir / "model.safetensors"
-            if not model_path.exists():
-                model_path = self.model_dir / "pytorch_model.bin"
-
-            state_dict = torch.load(model_path, map_location='cpu')
-            self.model.load_state_dict(state_dict)
+            self.model = ERPClassifierModel.from_pretrained(self.model_dir)
             self.model.eval()
 
         console.print(f"[bold green]✓ Model loaded successfully![/bold green]\n")
@@ -324,7 +316,7 @@ Examples:
     parser.add_argument(
         "--model-dir",
         type=str,
-        default="models/multimodal-classifier",
+        default="models/multimodal-v2",
         help="Path to trained model directory"
     )
     parser.add_argument(
