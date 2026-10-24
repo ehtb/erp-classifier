@@ -25,9 +25,9 @@ from sklearn.preprocessing import StandardScaler
 from rich.console import Console
 from rich.table import Table
 
-from .boundaries import amount_sensitive, counterfactual_amounts, near_boundary
+from .boundaries import amount_sensitive, counterfactual_amounts, near_boundary, price_band_edges
 from .config import LABEL2ID, get_gl_account
-from .text import scrub_record
+from .text import PRICE_BAND_FILE, scrub_record, set_price_band
 
 console = Console()
 
@@ -152,7 +152,10 @@ class MultimodalDatasetBuilder:
     - Department patterns from embeddings
     - Item semantics from text
 
-    NO GL classification logic here!
+    NO GL classification logic here, with one deliberate, opt-in exception: when
+    `price_band_edges` is set (build_splits(price_band=True)), the text gets a
+    rule-derived `[PRICE_BAND] n` token. That hands the model the rule boundary, so
+    it is a with-prior upper bound (config F), never the default.
     """
 
     def __init__(self, random_seed: int = 42):
@@ -160,6 +163,7 @@ class MultimodalDatasetBuilder:
         self.scaler = StandardScaler()
         self.dept_vocab = DepartmentVocabulary()
         self.fitted = False
+        self.price_band_edges = None  # set by build_splits(price_band=True)
 
     def extract_features(self, record: dict) -> MultimodalFeatures:
         """
@@ -167,6 +171,7 @@ class MultimodalDatasetBuilder:
 
         Text: [VENDOR] {vendor} [DESC] {description}
         NO price or department in text → model must learn from numerical/categorical features
+        (except the opt-in `[PRICE_BAND] n` token, see the class docstring)
         """
         # Text: vendor + description only (no price, no dept)
         text = f"[VENDOR] {record['vendor']} [DESC] {record['description']}"
@@ -174,6 +179,11 @@ class MultimodalDatasetBuilder:
         # Continuous: net_amount and log-transformed amount
         # Log transform helps model learn both small (10 EUR) and large (2000 EUR) amounts
         net_amount = float(record['net_amount_eur'])
+
+        # Two-stage model: stage 1 (rule-derived) labels the price band, stage 2 reads
+        # it as a text token. Counterfactual copies get the token for their own amount.
+        if self.price_band_edges is not None:
+            text = set_price_band(text, net_amount, self.price_band_edges)
         num_features = np.array([net_amount, np.log1p(net_amount)], dtype=np.float32)
 
         # Categorical: department
@@ -259,6 +269,7 @@ class MultimodalDatasetBuilder:
         bin_strategy: str = "quantile",
         bin_weighting: str = "unweighted",
         n_bins: int = 16,
+        price_band: bool = False,
     ) -> Tuple[Path, Path, Path]:
         """
         Build train/val/test splits with multimodal features.
@@ -268,6 +279,7 @@ class MultimodalDatasetBuilder:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        self.price_band_edges = list(price_band_edges()) if price_band else None
 
         # Scrub explicit price quotes before anything else: the description must not
         # be an alternative copy of the amount the model is supposed to read from the
@@ -364,6 +376,14 @@ class MultimodalDatasetBuilder:
                 'edges': edges,
             }, f, indent=2)
         console.print(f"💾 Saved amount bin edges ({bin_strategy}, {len(edges) - 1} bins) to {bins_path}")
+
+        band_path = output_dir / PRICE_BAND_FILE
+        if self.price_band_edges is not None:
+            with open(band_path, 'w') as f:
+                json.dump({'edges': self.price_band_edges}, f, indent=2)
+            console.print(f"💾 Saved price band edges {self.price_band_edges} to {band_path}")
+        elif band_path.exists():
+            band_path.unlink()  # stale file from an earlier two-stage build
 
         console.print(f"💾 Saved scaler to {scaler_path}")
         console.print(f"💾 Saved department vocabulary to {vocab_path}")

@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+**In short:** We tried giving the model a head start on the 800 EUR line: a first step labels each price as "below" or "above" 800, and the classifier reads that label along with the description. The switch from operating expense to capital expense now lands on 800 (to within the sweep's grid resolution) instead of about 0.6% away, but overall accuracy did not improve (95.7% vs 96.5%, within noise). The first step uses the same rule that creates the labels, so this shows the best case when the boundary is known, not that the model learned it.
+
+### Added
+- **Two-stage price band model** (`src/boundaries.py`, `src/text.py`, `src/multimodal_dataset.py`). `scripts/build_dataset.py --price-band` labels each amount with its band, using edges found by probing the accounting rules, and prepends `[PRICE_BAND] n` to the text. Counterfactual copies get the band for their own amount. The edges are saved as `price_band.json` and copied into the checkpoint.
+- **Amount-aware inference and sweeps** (`scripts/evaluate.py`, `scripts/evaluate_ensemble.py`, `scripts/baselines.py`, `classify_erp.py`). The band token is recomputed for every swept or typed amount, and checkpoints without `price_band.json` behave as before.
+- **Config F** in `scripts/run_ablation.py` (`--preset band` compares it with D), and `tests/test_price_band.py`.
+
+### Results (3 seeds, same split as D)
+| Config | Test acc | Sweep point acc | Tolerance step | One flip | Non-monotone | First crossing |
+|---|---|---|---|---|---|---|
+| D PLE + CF | 96.5% ± 0.6% | 0.950 | 100% | 100% | 0% | 0.6% [0.5, 0.7] |
+| F D + price band token | 95.7% ± 1.0% | 1.000 | 100% | 100% | 0% | 0.0006% |
+
+- F puts the flip on the boundary, and the sweep is right at every point. Test accuracy is not better, and the 0.8-point gap is about one item.
+- The constant-text check, which blanks the description, behaves like D (IT items stay at 93.9%), so the token adds nothing beyond what amount and department already give.
+- Because the edge comes from the labelling rule, F is a with-prior upper bound.
+
+---
+
 ## [0.4.0] - 2026-10-24
 
 **In short:** The model now handles the 800 EUR line much more cleanly: for the same product, it switches from operating expense to capital expense at the right price and stays there, instead of wobbling around it. We also corrected an earlier number that made the old version look better than it was, and made the test set stricter. Accuracy is 96.5%, the same as a much simpler word-count-plus-price-bucket model, so the reason to use the neural model is the smooth price behaviour, not the headline score.

@@ -5,6 +5,7 @@
 | C_periodic_cf | 3 | 95.7% ± 1.5% | 0.957 | 0.037 | 8/8, 8/8, 8/8 |
 | D_ple_quantile_cf | 3 | 96.5% ± 0.6% | 0.965 | 0.046 | 8/8, 8/8, 8/8 |
 | E_ple_tree_cf | 3 | 95.3% ± 0.7% | 0.953 | 0.041 | 8/8, 8/8, 8/8 |
+| F_ple_quantile_cf_band | 3 | 95.7% ± 1.0% | 0.958 | 0.040 | 8/8, 8/8, 8/8 |
 
 | Config | Sweep point | Strict | Tight ±6.25% | Tolerance step | One flip | Non-monotone | Max neg. step | First-crossing error (seed range) | Coverage |
 |---|---|---|---|---|---|---|---|---|---|
@@ -13,6 +14,7 @@
 | C_periodic_cf | 0.971 | 0.955 | 0.881 | 99% | 99% | 4% | 0.119 | 0.1% [0.0, 0.1] | 100% |
 | D_ple_quantile_cf | 0.950 | 0.948 | 0.795 | 100% | 100% | 0% | 0.006 | 0.6% [0.5, 0.7] | 100% |
 | E_ple_tree_cf | 0.935 | 0.935 | 0.731 | 73% | 100% | 0% | 0.000 | 1.6% [0.6, 2.1] | 100% |
+| F_ple_quantile_cf_band | 1.000 | 1.000 | 1.000 | 100% | 100% | 0% | 0.001 | 0.0% [0.0, 0.0] | 100% |
 
 Notes:
 - `±` is the training-seed standard deviation on one fixed test set, not test-set uncertainty.
@@ -20,3 +22,4 @@ Notes:
 - `Tolerance step` requires the correct account at every amount outside a ±2% band around the boundary. The old `perfect step` also required the ±0.001% points and is 0% by construction.
 - `Non-monotone` means any negative step in p(above) larger than 0.05; `Max neg. step` reports the largest such drop.
 - `Real near-boundary` counts actual test items within ±12.5% of a rule boundary (not synthetic sweep points); it is shown per seed.
+- Two-stage price band model (`F_ple_quantile_cf_band`): the band edges come from the same accounting rule that produces the labels, so the sweep and crossing numbers are a with-prior upper bound, not evidence that the boundary was learned. The `price_stripped` text ablation does not remove the band token.

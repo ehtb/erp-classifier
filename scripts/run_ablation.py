@@ -1,6 +1,8 @@
 """
 Reproduce the A-E encoding/counterfactual ablation and the class-weight ablation
-on one deterministic split.
+on one deterministic split. `--preset band` compares D with F, the two-stage model
+that gets a rule-derived price band token (a with-prior upper bound). It writes its own
+band_ablation.md; the all-configs table is `summarize_ablation.py --root output/ablation`.
 
 Each configuration gets its own dataset directory (scaler and bin edges are fit
 on its own training data) unless it reuses an identical dataset configuration,
@@ -27,6 +29,7 @@ CONFIGS = {
     "C_periodic_cf":       {"counterfactuals": 4, "encoding": "periodic", "bins": "quantile", "weight_mode": "cf",       "seeds": [42, 43, 44]},
     "D_ple_quantile_cf":   {"counterfactuals": 4, "encoding": "ple",      "bins": "quantile", "weight_mode": "cf",       "seeds": [42, 43, 44]},
     "E_ple_tree_cf":       {"counterfactuals": 4, "encoding": "ple",      "bins": "tree",     "weight_mode": "cf",       "seeds": [42, 43, 44]},
+    "F_ple_quantile_cf_band": {"counterfactuals": 4, "encoding": "ple", "bins": "quantile", "weight_mode": "cf", "seeds": [42, 43, 44], "price_band": True},
     "C_balanced":          {"counterfactuals": 4, "encoding": "periodic", "bins": "quantile", "weight_mode": "balanced", "seeds": [42],         "data_dir": "output/multimodal"},
     "D_balanced":          {"counterfactuals": 4, "encoding": "ple",      "bins": "quantile", "weight_mode": "balanced", "seeds": [42],         "data_dir": "output/multimodal"},
     "D_none":              {"counterfactuals": 4, "encoding": "ple",      "bins": "quantile", "weight_mode": "none",     "seeds": [42, 43, 44], "data_dir": "output/multimodal"},
@@ -34,6 +37,7 @@ CONFIGS = {
 
 PRESETS = {
     "main": ["A_periodic_nocf", "B_ple_quantile_nocf", "C_periodic_cf", "D_ple_quantile_cf", "E_ple_tree_cf"],
+    "band": ["D_ple_quantile_cf", "F_ple_quantile_cf_band"],
     "weights": ["C_balanced", "D_balanced", "D_none"],
     "all": list(CONFIGS),
 }
@@ -70,9 +74,11 @@ def main():
     configs = args.configs or PRESETS[args.preset]
     data_root_rel = args.data_root or ("output/weight_ablation" if is_weights else "output/ablation")
     model_root_rel = args.model_root or ("models/weight_ablation" if is_weights else "models/ablation")
+    is_band = args.preset == "band" and args.configs is None
     summary_rel = args.summary or (
-        "output/evaluation-multimodal/weight_ablation.md"
-        if is_weights else "output/evaluation-multimodal/ablation_summary.md"
+        "output/evaluation-multimodal/weight_ablation.md" if is_weights
+        else "output/evaluation-multimodal/band_ablation.md" if is_band
+        else "output/evaluation-multimodal/ablation_summary.md"
     )
 
     data_root = ROOT / data_root_rel
@@ -94,7 +100,7 @@ def main():
                 "--counterfactuals-per-record", cfg["counterfactuals"],
                 "--bin-strategy", cfg["bins"],
                 "--seed", 42,
-            ], ROOT / f"logs/ablation/{name}_build.log")
+            ] + (["--price-band"] if cfg.get("price_band") else []), ROOT / f"logs/ablation/{name}_build.log")
 
         for seed in seeds:
             model_dir = model_root / name / f"seed{seed}"
@@ -126,6 +132,9 @@ def main():
         "--root", data_root_rel,
         "--output", summary_rel,
     ]
+    if is_band:
+        # Own file, limited to D and F, so this never overwrites the A-E table.
+        summarize_cmd += ["--configs", *PRESETS["band"]]
     if args.csv:
         summarize_cmd += ["--csv", args.csv]
     run(summarize_cmd, ROOT / "logs/ablation/summarize.log")

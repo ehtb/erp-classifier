@@ -5,13 +5,19 @@ sometimes wrote it into the text ("... for 678 EUR"). That is a direct leak of
 the numeric feature. `scrub_record` removes those explicit quotes at build time
 and records that the source contained one, so evaluation can still slice on it.
 
+(The opt-in price band token at the bottom of this module is the one deliberate
+exception: it re-adds a rule-derived band label for the two-stage model.)
+
 It deliberately does not try to remove the *style* correlation with price
 ("premium", "ultrawide", ...): that is a property of the generator, not an
 explicit field leak, and removing it requires regenerating the text.
 """
 
+import bisect
+import json
 import re
-from typing import Dict
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
 
 # Currency-marked amounts in either order, plus the generator's standalone
 # two-decimal format ("799.00"). One-decimal values ("2.5 m cable") are left
@@ -59,3 +65,43 @@ def scrub_record(record: Dict) -> Dict:
     if new.get("title"):
         new["title"] = scrub_prices(new["title"])
     return new
+
+
+# --- Price band token (two-stage model) -------------------------------------
+# Stage 1 labels the amount with the band it falls in, using edges taken from the
+# accounting rules. Stage 2 is the normal classifier, which sees that label as a
+# token at the start of the text. Because the edges come from the labelling rule,
+# this gives the model the answer for the amount-sensitive classes: treat results
+# as a with-prior upper bound, not as evidence the boundary was learned.
+
+PRICE_BAND_FILE = "price_band.json"
+_BAND_RE = re.compile(r"^\[PRICE_BAND\]\s*\d+\s*")
+
+
+def price_band_index(amount: float, edges: Sequence[float]) -> int:
+    """Number of band edges at or below `amount` (an amount equal to an edge is above it)."""
+    # bisect_right: an amount equal to an edge is "at or above" it. This matches rules of
+    # the form "< edge" / ">= edge"; price_band_edges() refuses edges where it would not.
+    return bisect.bisect_right(edges, amount)
+
+
+def set_price_band(text: str, amount: float, edges: Sequence[float]) -> str:
+    """Return `text` with its price band token set for `amount` (replacing any existing one)."""
+    body = _BAND_RE.sub("", text)
+    return f"[PRICE_BAND] {price_band_index(amount, edges)} {body}"
+
+
+def sweep_texts(text: str, amounts: Sequence[float], edges: Optional[Sequence[float]]) -> List[str]:
+    """The text to score at each swept amount: the band token follows the amount, else fixed text."""
+    if edges is None:
+        return [text] * len(amounts)
+    return [set_price_band(text, a, edges) for a in amounts]
+
+
+def load_price_band_edges(directory: Path) -> Optional[List[float]]:
+    """Band edges saved next to a dataset or checkpoint, or None for a single-stage model."""
+    path = Path(directory) / PRICE_BAND_FILE
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return [float(e) for e in json.load(f)["edges"]]

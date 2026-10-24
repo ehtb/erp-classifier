@@ -33,7 +33,7 @@ from rich.prompt import Prompt, FloatPrompt
 
 from src.model import ERPClassifierModel
 from src.config import ID2LABEL
-from src.text import scrub_prices
+from src.text import load_price_band_edges, scrub_prices, set_price_band
 
 console = Console()
 
@@ -95,6 +95,9 @@ class ERPClassifier:
             self.scaler_mean = np.array(scaler_params['mean'])
             self.scaler_scale = np.array(scaler_params['scale'])
 
+        # Two-stage checkpoints ship price band edges; older ones do not.
+        self.band_edges = load_price_band_edges(self.model_dir)
+
         # Load dept vocab
         vocab_path = self._artifact("dept_vocab.json")
 
@@ -133,6 +136,8 @@ class ERPClassifier:
         # Prepare text input. Scrub explicit price quotes: training text is scrubbed,
         # and the amount belongs in the numeric branch, not in the description.
         text = f"[VENDOR] {vendor} [DESC] {scrub_prices(description)}"
+        if self.band_edges is not None:
+            text = set_price_band(text, net_amount_eur, self.band_edges)
         encoding = self.tokenizer(
             text,
             truncation=True,

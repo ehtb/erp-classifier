@@ -29,6 +29,7 @@ from src.config import LABEL2ID  # noqa: E402
 from src.metrics import DEFAULT_STEP_TOL_REL, risk_coverage, sweep_case_metrics, wilson_ci  # noqa: E402
 from src.model import get_device, load_model, predict_probs  # noqa: E402
 from src.multimodal_dataset import load_multimodal_dataset  # noqa: E402
+from src.text import load_price_band_edges, sweep_texts  # noqa: E402
 
 
 def load_models(model_dirs, device):
@@ -59,7 +60,7 @@ def agreement_curve(agreement, correct):
     return out
 
 
-def sweep_ensemble(models, records, device):
+def sweep_ensemble(models, records, device, band_edges=None):
     cases = []
     point_rows = []
     for r in records:
@@ -71,7 +72,9 @@ def sweep_ensemble(models, records, device):
                 feats = np.stack([amounts, np.log1p(amounts)], axis=1)
                 z = ((feats - mean) / scale).astype(np.float32)
                 p = predict_probs(
-                    model, tokenizer, [r['text']] * len(amounts), z,
+                    model, tokenizer,
+                    sweep_texts(r['text'], amounts, band_edges),
+                    z,
                     [r['dept_id']] * len(amounts), device,
                 )
                 lo, hi = LABEL2ID[b.below], LABEL2ID[b.above]
@@ -148,12 +151,17 @@ def main():
     correct = preds == labels
     confidence = mean_probs.max(-1)
     agreement = (test_probs.argmax(-1) == preds).mean(0)
+    band_sets = {tuple(load_price_band_edges(d) or ()) for d in args.model_dirs}
+    if len(band_sets) != 1:
+        raise SystemExit(f"Models disagree on price band edges: {band_sets}")
+    band_edges = list(band_sets.pop()) or None
 
     k, n = int(correct.sum()), len(labels)
     curve, chosen = risk_coverage(confidence, correct.astype(float))
     results = {
         'model_dirs': args.model_dirs,
         'n_models': len(args.model_dirs),
+        'price_band_edges': band_edges,
         'n_test': n,
         'accuracy': k / n,
         'accuracy_ci95': wilson_ci(k, n),
@@ -161,7 +169,7 @@ def main():
         'risk_coverage': curve,
         'cutoff_for_99pct': chosen,
         'agreement_coverage': agreement_curve(agreement, correct.astype(float)),
-        'sweep': sweep_ensemble(models, test, device),
+        'sweep': sweep_ensemble(models, test, device, band_edges),
     }
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, 'w') as f:

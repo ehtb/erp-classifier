@@ -375,7 +375,7 @@ def main():
     trainer.save_model()
     tokenizer.save_pretrained(output_dir)
     # Keep preprocessing artifacts next to the checkpoint so inference/eval need no hard-coded paths
-    for name in ("scaler.json", "dept_vocab.json", "numeric_bins.json"):
+    for name in ("scaler.json", "dept_vocab.json", "numeric_bins.json", "price_band.json"):
         if (data_dir / name).exists():
             shutil.copy(data_dir / name, output_dir / name)
 

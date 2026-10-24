@@ -10,7 +10,7 @@ boundary-aware splits, counterfactual augmentation and sweep tests follow.
 
 import math
 from functools import lru_cache
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
@@ -48,6 +48,31 @@ def boundaries(category: Optional[str]) -> List[Boundary]:
                     b = mid
             found.append(Boundary(round(float(b), 6), labels[i], labels[i + 1]))
     return found
+
+
+@lru_cache(maxsize=None)
+def price_band_edges() -> Tuple[float, ...]:
+    """
+    Every distinct decision boundary across all categories, ascending.
+
+    These are the edges of the price bands for the two-stage model: stage 1 only
+    asks which band an amount falls in, and needs no category, so it works at
+    inference where the category is not known. One global edge set assumes no
+    non-amount-sensitive category prices past an edge (true today: max 500 vs 800);
+    if one did, only its token would change, not its label.
+    """
+    found = {}
+    for c in PRICE_RANGES:
+        for b in boundaries(c):
+            # The token puts an amount equal to an edge on the upper side. That is only
+            # right when the rule is "at or above"; refuse a strict "> edge" rule.
+            if _gl(c, b.amount) != b.above:
+                raise ValueError(
+                    f"Rule for {c} treats {b.amount} as {b.below}, not {b.above}; "
+                    "price band edges assume the boundary amount belongs to the upper side"
+                )
+            found[b.amount] = True
+    return tuple(sorted(found))
 
 
 def amount_sensitive(category: Optional[str]) -> bool:

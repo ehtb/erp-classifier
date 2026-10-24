@@ -173,6 +173,14 @@ python scripts/run_ablation.py --seeds 42 43 44
 # Class-weight ablation (writes output/evaluation-multimodal/weight_ablation.md)
 python scripts/run_ablation.py --preset weights
 
+# Two-stage model F: D plus a rule-derived price band token (with-prior upper bound).
+# Writes its own band_ablation.md (D and F only), so it never overwrites the A-E table.
+python scripts/run_ablation.py --preset band --seeds 42 43 44
+
+# All configs in one table, after running both presets above
+python scripts/summarize_ablation.py --root output/ablation \
+  --output output/evaluation-multimodal/ablation_summary.md
+
 # Non-neural baselines (with and without counterfactuals in one file)
 python scripts/baselines.py \
   --data-dir output/multimodal \
@@ -186,6 +194,29 @@ python scripts/evaluate_ensemble.py \
   --test-data output/multimodal/test_multimodal.jsonl \
   --output output/evaluation-multimodal/ensemble.json
 ```
+
+### Two-stage price band model (config F)
+
+Stage 1 labels each amount with the price band it falls in. The band edges are
+found by probing the accounting rules (`price_band_edges()` in `src/boundaries.py`),
+so there is one edge today, at 800 EUR. Stage 2 is the usual classifier, which reads
+the label as a `[PRICE_BAND] 0` or `[PRICE_BAND] 1` token at the start of the text.
+
+```bash
+# Minimal example; config F also uses --counterfactuals-per-record 4 (the default)
+# and --bin-strategy quantile, as in scripts/run_ablation.py.
+python scripts/build_dataset.py --input output/03_filtered.jsonl \
+  --output-dir output/multimodal-band --price-band
+```
+
+The edges are saved as `price_band.json` next to the dataset and are copied into the
+checkpoint by `train.py`. Evaluation, the ensemble script, the baselines and
+`classify_erp.py` read that file and recompute the token for every swept or typed
+amount. Older checkpoints without the file behave as before.
+
+Because the edges come from the rule that produces the labels, this setup hands
+the model the boundary. Read its sweep numbers as an upper bound, not as evidence
+that the boundary was learned.
 
 ## Architecture Details
 
@@ -274,13 +305,13 @@ See main [README](README.md) for detailed usage.
 from transformers import AutoTokenizer
 from src.model import ERPClassifierModel
 from src.config import ID2LABEL
-from src.text import scrub_prices
+from src.text import load_price_band_edges, scrub_prices, set_price_band
 import torch, numpy as np, json
 
 MODEL_DIR = "models/multimodal-classifier"
 
-# train.py copies scaler.json, dept_vocab.json and numeric_bins.json next to the
-# checkpoint; from_pretrained restores num_encoding and the bin edges from config.
+# train.py copies scaler.json, dept_vocab.json, numeric_bins.json (and price_band.json for
+# a two-stage checkpoint) next to the checkpoint; from_pretrained restores num_encoding and the bin edges from config.
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 model = ERPClassifierModel.from_pretrained(MODEL_DIR).eval()
 
@@ -289,9 +320,15 @@ with open(f"{MODEL_DIR}/scaler.json") as f:
 with open(f"{MODEL_DIR}/dept_vocab.json") as f:
     dept_vocab = json.load(f)['dept2id']
 
+# Only two-stage (--price-band) checkpoints ship price_band.json; for those the band
+# token must be added for every amount, or the model is silently misconfigured.
+band_edges = load_price_band_edges(MODEL_DIR)  # None for a normal checkpoint
+
 # Predict
 def predict(vendor, description, department, net_amount_eur):
     text = f"[VENDOR] {vendor} [DESC] {scrub_prices(description)}"
+    if band_edges is not None:
+        text = set_price_band(text, net_amount_eur, band_edges)
     encoding = tokenizer(text, truncation=True, max_length=128, 
                          padding='max_length', return_tensors='pt')
     
@@ -399,7 +436,7 @@ scripts/ (pipeline tools):
 ├── build_dataset.py       # Convert JSONL → multimodal splits
 ├── evaluate.py            # Test evaluation, sweep, text ablations
 ├── baselines.py           # TF-IDF/GBDT baselines + their amount sweeps
-├── run_ablation.py        # Reproduce the A-E and class-weight ablations
+├── run_ablation.py        # Reproduce the A-E, class-weight and D-vs-F (price band) ablations
 ├── evaluate_ensemble.py   # Seed ensemble risk-coverage and sweep disagreement
 └── summarize_ablation.py  # Markdown aggregation
 ```

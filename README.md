@@ -60,10 +60,12 @@ Instead of forcing text models to parse numbers, we treat ERP transactions as **
 
 What's new in v0.4.0:
 
-1. **Piecewise-linear amount encoding.** The amount is split into ramps between bin edges taken from the training data. A higher amount can only push the score one way, which keeps the price behaviour smooth. This replaces the older sin/cos encoder as the default.
-2. **Counterfactual training copies.** For each IT record, training adds 4 copies with the amount moved near the 800 EUR line and the label recomputed from the rules (`src/boundaries.py`). An original and its copies share one unit of weight (1/5 each), so a product family still counts once.
-3. **Price scrubbing and grouped splits.** Prices written into descriptions are removed at build time and again at inference (`src/text.py`). Near-duplicate product titles always land in the same split, so the test set can't contain a twin of a training item.
+1. **Piecewise-linear amount encoding.** The amount goes through ramps between bin edges taken from the training data, so a higher amount can only push the score in one direction. It is the default; `--num-encoding periodic` in `train.py` brings back the older sin/cos encoder.
+2. **Counterfactual training copies.** For each IT record, training adds 4 copies with the amount moved near the 800 EUR line and the label recomputed from the rules (`src/boundaries.py`). An original and its copies share one unit of weight (1/5 each), so a product family still counts once. It is the default; `--counterfactuals-per-record 0` in `build_dataset.py` turns it off.
+3. **Price scrubbing and grouped splits.** We strip prices written into descriptions at build time and again at inference (`src/text.py`). Near-duplicate product titles always land in the same split, so the test set can't contain a twin of a training item. This part is always on.
 4. **FiLM gating, department dropout (15%), label smoothing (0.05).** These carry over from earlier versions.
+
+The price band mode described under Results is a separate option and is off by default.
 
 ## Results
 
@@ -90,6 +92,17 @@ The counterfactual copies help the simple binned baseline as well as the neural 
 The cutoff is the lowest confidence at which validation accuracy reaches 99%. That gives **0.90** (seed 42):
 - **Auto-posted:** 133 of 141 test items (94.3%), all correct
 - **Sent to manual review:** 8 of 141 (5.7%)
+
+### Optional: price band mode
+
+Build the dataset with `--price-band` and a first step labels each amount as below or above the 800 EUR line, using the accounting rules. The classifier then gets that label as a token at the start of its text. The OPEX to CAPEX switch lands right on 800 instead of about 0.6% off. Overall accuracy stays the same (95.7% vs 96.5%, within noise), since the model already got every real item near 800 right. The mode is off by default, because it hands the model the rule instead of letting it learn it.
+
+```bash
+python scripts/build_dataset.py --input output/03_filtered.jsonl \
+  --output-dir output/multimodal-band --price-band
+```
+
+Checkpoints trained on this data carry a `price_band.json`, and `classify_erp.py` applies it on its own. Details are in [BUILDING.md](BUILDING.md).
 
 ## Quick Start: Using the Trained Model
 

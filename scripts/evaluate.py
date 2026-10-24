@@ -44,7 +44,7 @@ from src.metrics import (  # noqa: E402
 )
 from src.model import get_device, load_model, predict_probs  # noqa: E402
 from src.multimodal_dataset import load_multimodal_dataset  # noqa: E402
-from src.text import scrub_prices  # noqa: E402
+from src.text import load_price_band_edges, scrub_prices, sweep_texts  # noqa: E402
 
 console = Console()
 
@@ -128,7 +128,8 @@ def evaluate_text_variant(model, tokenizer, records, texts, device):
 
 
 def amount_sweep(model, tokenizer, records, scaler_mean, scaler_scale, device,
-                 mono_tol: float = 0.05, step_tol_rel: float = DEFAULT_STEP_TOL_REL):
+                 mono_tol: float = 0.05, step_tol_rel: float = DEFAULT_STEP_TOL_REL,
+                 band_edges=None):
     """
     Re-score each amount-sensitive test description around each rule boundary with
     text and department fixed. The two accounts either side of the boundary should
@@ -138,6 +139,9 @@ def amount_sweep(model, tokenizer, records, scaler_mean, scaler_scale, device,
     crossing, interpolated in log-amount), not only for cases that happen to have
     exactly one flip. The conditioned version is kept separately as
     `single_flip_crossing_rel_error` for continuity with earlier runs.
+
+    For a two-stage model (`band_edges` given) the price band token is recomputed
+    for every swept amount; otherwise the fixed text would hide the amount.
     """
     cases = []
     single_flip_errors = []
@@ -149,7 +153,9 @@ def amount_sweep(model, tokenizer, records, scaler_mean, scaler_scale, device,
             feats = np.stack([amounts, np.log1p(amounts)], axis=1)
             feats = ((feats - scaler_mean) / scaler_scale).astype(np.float32)
             probs = predict_probs(
-                model, tokenizer, [r['text']] * len(amounts), feats,
+                model, tokenizer,
+                sweep_texts(r['text'], amounts, band_edges),
+                feats,
                 [r['dept_id']] * len(amounts), device,
             )
             lo_id, hi_id = LABEL2ID[b.below], LABEL2ID[b.above]
@@ -200,6 +206,9 @@ def main():
 
     console.print(f"🤖 Loading model from {args.model_dir}...")
     model, tokenizer, scaler_mean, scaler_scale = load_model(Path(args.model_dir), device)
+    band_edges = load_price_band_edges(Path(args.model_dir))  # None for a single-stage model
+    if band_edges is not None:
+        console.print(f"  Two-stage model: price band edges {band_edges}")
     val_records = load_multimodal_dataset(Path(args.val_data))
     test_records = load_multimodal_dataset(Path(args.test_data))
 
@@ -251,8 +260,13 @@ def main():
     if not args.skip_text_ablations:
         variants = {
             'normal': [r['text'] for r in test_records],
+            # Removes quoted prices only; the [PRICE_BAND] token of a two-stage model stays.
             'price_stripped': [scrub_prices(r['text']) for r in test_records],
-            'constant_text': ['[VENDOR] Amazon Services Europe [DESC] office product'] * len(test_records),
+            'constant_text': [
+                sweep_texts('[VENDOR] Amazon Services Europe [DESC] office product',
+                            [r['metadata']['net_amount_eur']], band_edges)[0]
+                for r in test_records
+            ],
         }
         for name, texts in variants.items():
             text_ablations[name] = evaluate_text_variant(model, tokenizer, test_records, texts, device)
@@ -273,6 +287,7 @@ def main():
     sweep = amount_sweep(
         model, tokenizer, test_records, scaler_mean, scaler_scale, device,
         mono_tol=args.mono_tolerance, step_tol_rel=args.step_tolerance,
+        band_edges=band_edges,
     )
     console.print("\n[bold]Amount sweep (text/department fixed, amount varied around each boundary):[/bold]")
     console.print(f"  cases: {sweep['cases']}  point accuracy: {sweep['point_accuracy']:.3f}  "
@@ -317,6 +332,7 @@ def main():
     cm = confusion_matrix(labels, preds, labels=label_ids)
     results = {
         'seed': args.seed,
+        'price_band_edges': band_edges,
         'n_test': n,
         'n_groups': len(set(groups)),
         'accuracy': k / n,

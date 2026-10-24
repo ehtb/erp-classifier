@@ -73,6 +73,15 @@ def main():
         )
     )
     parser.add_argument(
+        "--price-band",
+        action="store_true",
+        help=(
+            "Two-stage model: label each amount with its price band (edges from the "
+            "accounting rules) and prepend it to the text as [PRICE_BAND] n. This hands "
+            "the model the rule boundary, so treat results as a with-prior upper bound."
+        )
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -105,6 +114,7 @@ def main():
         counterfactuals_per_record=args.counterfactuals_per_record,
         bin_strategy=args.bin_strategy,
         bin_weighting=args.bin_weighting,
+        price_band=args.price_band,
     )
 
     console.print(f"\n[bold green]✓ Multimodal dataset created successfully![/bold green]")

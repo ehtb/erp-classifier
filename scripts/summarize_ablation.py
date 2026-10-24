@@ -96,10 +96,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="output/ablation")
     ap.add_argument("--output", default="output/evaluation-multimodal/ablation_summary.md")
+    ap.add_argument("--configs", nargs="+", default=None,
+                    help="Only summarize these config directories (default: all under --root)")
     ap.add_argument("--csv", default=None, help="Optional path to write per-seed CSV rows")
     args = ap.parse_args()
 
     rows = load_rows(args.root)
+    if args.configs:
+        rows = {c: v for c, v in rows.items() if c in args.configs}
     if not rows:
         raise SystemExit(f"No evaluation summaries under {args.root}/*/eval_seed*/")
 
@@ -181,6 +185,16 @@ def main():
         "- `Non-monotone` means any negative step in p(above) larger than 0.05; `Max neg. step` reports the largest such drop.",
         "- `Real near-boundary` counts actual test items within ±12.5% of a rule boundary (not synthetic sweep points); it is shown per seed.",
     ]
+    band_configs = sorted(
+        c for c, ds in rows.items() if any(d.get("price_band_edges") for d in ds)
+    )
+    if band_configs:
+        lines.append(
+            f"- Two-stage price band model ({', '.join(f'`{c}`' for c in band_configs)}): "
+            "the band edges come from the same accounting rule that produces the labels, so the "
+            "sweep and crossing numbers are a with-prior upper bound, not evidence that the "
+            "boundary was learned. The `price_stripped` text ablation does not remove the band token."
+        )
     if args.csv:
         lines.append(f"- Raw per-seed rows: `{args.csv}`.")
 

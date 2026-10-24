@@ -33,7 +33,7 @@ from src.metrics import (  # noqa: E402
     sweep_case_metrics,
     wilson_ci,
 )
-from src.text import scrub_prices  # noqa: E402
+from src.text import load_price_band_edges, scrub_prices, sweep_texts  # noqa: E402
 
 
 def load(path):
@@ -96,14 +96,18 @@ def full_probs(model, X):
     return out
 
 
-def sweep_baseline(name, proba, recs):
-    """Run the fixed-text amount sweep for a baseline's probability function."""
+def sweep_baseline(name, proba, recs, band_edges=None):
+    """Run the fixed-text amount sweep for a baseline's probability function.
+
+    `band_edges` is set for a dataset built with --price-band: the band token in the
+    text then follows each swept amount.
+    """
     cases = []
     for r in recs:
         cat = r['metadata'].get('base_category')
         for b in boundaries(cat):
             amounts = sweep_amounts(b.amount)
-            texts = [r['text']] * len(amounts)
+            texts = sweep_texts(r['text'], amounts, band_edges)
             depts = [r['dept_id']] * len(amounts)
             p = proba(texts, amounts, depts)
             lo, hi = _label_id(b.below), _label_id(b.above)
@@ -126,7 +130,8 @@ def _label_id(label):
     return LABEL2ID[label]
 
 
-def run_suite(tr, te, *, use_sample_weights: bool = True, skip_sweep: bool = False):
+def run_suite(tr, te, *, use_sample_weights: bool = True, skip_sweep: bool = False,
+              band_edges=None):
     """Fit and evaluate all non-neural baselines on `(tr, te)`."""
     ytr, yte = np.array([r['label'] for r in tr]), np.array([r['label'] for r in te])
     Xtr_t, Xte_t = tab(tr), tab(te)
@@ -205,10 +210,10 @@ def run_suite(tr, te, *, use_sample_weights: bool = True, skip_sweep: bool = Fal
 
     if not skip_sweep:
         out['sweeps'] = {
-            'amount+dept GBDT': sweep_baseline("amount+dept GBDT", gb_proba, te),
-            'tfidf LR (text only)': sweep_baseline("text only", text_proba, te),
-            'tfidf LR (price-stripped)': sweep_baseline("text price-stripped", text_ps_proba, te),
-            'tfidf+tabular LR': sweep_baseline("text+tabular", tab_proba, te),
+            'amount+dept GBDT': sweep_baseline("amount+dept GBDT", gb_proba, te, band_edges),
+            'tfidf LR (text only)': sweep_baseline("text only", text_proba, te, band_edges),
+            'tfidf LR (price-stripped)': sweep_baseline("text price-stripped", text_ps_proba, te, band_edges),
+            'tfidf+tabular LR': sweep_baseline("text+tabular", tab_proba, te, band_edges),
         }
     return out
 
@@ -222,6 +227,7 @@ def main():
     args = ap.parse_args()
 
     d = Path(args.data_dir)
+    band_edges = load_price_band_edges(d)
     tr, te = load(d / "train_multimodal.jsonl"), load(d / "test_multimodal.jsonl")
     use_sw = not args.no_sample_weights
     out = {
@@ -229,6 +235,7 @@ def main():
         'train_sha256': sha256(d / "train_multimodal.jsonl"),
         'test_sha256': sha256(d / "test_multimodal.jsonl"),
         'n_test': len(te),
+        'price_band_edges': band_edges,
     }
 
     has_cf = any(r.get('metadata', {}).get('counterfactual', False) for r in tr)
@@ -240,15 +247,18 @@ def main():
         print(f"=== Without counterfactuals (n_train={len(tr_orig)}) ===")
         out['without_counterfactuals'] = run_suite(
             tr_orig, te, use_sample_weights=use_sw, skip_sweep=args.skip_sweep,
+            band_edges=band_edges,
         )
         print(f"\n=== With counterfactuals (n_train={len(tr)}) ===")
         out['with_counterfactuals'] = run_suite(
             tr, te, use_sample_weights=use_sw, skip_sweep=args.skip_sweep,
+            band_edges=band_edges,
         )
     else:
         print(f"=== Without counterfactuals (n_train={len(tr)}) ===")
         out['without_counterfactuals'] = run_suite(
             tr, te, use_sample_weights=use_sw, skip_sweep=args.skip_sweep,
+            band_edges=band_edges,
         )
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
