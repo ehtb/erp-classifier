@@ -51,6 +51,7 @@ output/multimodal/*
 output/evaluation-multimodal/*
 !output/evaluation-multimodal/*.json
 !output/evaluation-multimodal/*.png
+!output/evaluation-multimodal/*.md
 
 *.arrow
 *.parquet
@@ -70,6 +71,8 @@ DEPLOYMENT.md
 serve_api.py
 
 # Temporary
+.serena/
+runs/
 tmp/
 temp/
 *.tmp

@@ -11,6 +11,8 @@ That threshold is why we oversample prices between 650 and 950 EUR when generati
 training data.
 """
 
+import operator
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Dict, Tuple
@@ -56,6 +58,10 @@ class TextStyle(str, Enum):
     GENERIC_AMBIGUOUS = "GENERIC_AMBIGUOUS"
 
 
+_THRESHOLD_RE = re.compile(r"^\s*(<=|>=|<|>)\s*([0-9]+(?:\.[0-9]+)?)\s*$")
+_OPERATORS = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge}
+
+
 @dataclass
 class AccountingRule:
     """Defines business logic for GL classification."""
@@ -63,6 +69,10 @@ class AccountingRule:
     gl_account: GLAccount
     base_category: str
     threshold_rule: str | None = None
+
+    def __post_init__(self):
+        if self.threshold_rule is not None and not _THRESHOLD_RE.match(self.threshold_rule):
+            raise ValueError(f"Invalid threshold_rule: {self.threshold_rule!r}")
 
     def applies(self, amount_eur: float, category: str) -> bool:
         """Check if this rule applies to the given context."""
@@ -72,13 +82,13 @@ class AccountingRule:
         if self.threshold_rule is None:
             return True
 
-        # Parse threshold rule: "< 800" or ">= 800"
-        if "< 800" in self.threshold_rule:
-            return amount_eur < 800.0
-        elif ">= 800" in self.threshold_rule:
-            return amount_eur >= 800.0
+        # Parse threshold rule such as "< 800", ">= 800" (operator + EUR amount)
+        match = _THRESHOLD_RE.match(self.threshold_rule)
+        if not match:
+            raise ValueError(f"Invalid threshold_rule: {self.threshold_rule!r}")
 
-        return True
+        op, limit = match.group(1), float(match.group(2))
+        return _OPERATORS[op](amount_eur, limit)
 
 
 # Accounting rules with explicit IT hardware threshold.

@@ -6,12 +6,18 @@ Fuses text embeddings (vendor, description) with continuous numerical features
 to learn GL account classification without hardcoded business rules.
 """
 
+from pathlib import Path
 from typing import Optional
+import json
 import math
+import numpy as np
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModel, PreTrainedModel
+import torch.nn.functional as F
+from transformers import AutoConfig, AutoModel, AutoTokenizer, PreTrainedModel
 from transformers.modeling_outputs import SequenceClassifierOutput
+
+from .config import NUM_LABELS
 
 
 class PeriodicNumericalEncoding(nn.Module):
@@ -58,6 +64,34 @@ class PeriodicNumericalEncoding(nn.Module):
         return features.view(batch_size, -1)
 
 
+class PiecewiseLinearEncoding(nn.Module):
+    """
+    Piecewise-linear encoding (PLE) of one numeric feature.
+
+    Each bin b contributes clip((x - e_b) / (e_{b+1} - e_b), 0, 1): a ramp that is 0
+    below the bin, 1 above it and linear inside. The ramps are monotone in x and
+    fixed (no learnable frequencies), so the head can express a step at any bin edge
+    with a handful of weights. Edges are learned from training data by the dataset
+    builder (quantiles or target-aware tree splits), never hard-coded here.
+    The raw features are appended so the head still sees the continuous value.
+    """
+
+    def __init__(self, edges, feature_idx: int, input_dim: int):
+        super().__init__()
+        if edges is None or len(edges) < 2:
+            raise ValueError("PiecewiseLinearEncoding requires at least 2 bin edges")
+        edges = torch.tensor(edges, dtype=torch.float32)
+        self.register_buffer("lower", edges[:-1])
+        self.register_buffer("width", (edges[1:] - edges[:-1]).clamp_min(1e-6))
+        self.feature_idx = feature_idx
+        self.out_dim = input_dim + len(edges) - 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        v = x[:, self.feature_idx].unsqueeze(-1)
+        ramps = ((v - self.lower) / self.width).clamp(0.0, 1.0)
+        return torch.cat([x, ramps], dim=-1)
+
+
 class ERPClassifierModel(PreTrainedModel):
     """
     Multimodal classifier that fuses:
@@ -86,7 +120,11 @@ class ERPClassifierModel(PreTrainedModel):
         num_depts: Optional[int] = None,
         num_continuous: Optional[int] = None,
         class_weights: Optional[torch.Tensor] = None,
+        use_class_weights: Optional[bool] = None,
         load_pretrained_encoder: bool = True,
+        num_encoding: Optional[str] = None,
+        numeric_bin_edges: Optional[list] = None,
+        numeric_bin_feature_idx: Optional[int] = None,
     ):
         super().__init__(config)
 
@@ -94,8 +132,24 @@ class ERPClassifierModel(PreTrainedModel):
         self.model_name = model_name or getattr(config, "base_model_name", "distilbert-base-uncased")
         self.num_depts = num_depts or getattr(config, "num_depts", 10)
         self.num_continuous = num_continuous or getattr(config, "num_continuous", 2)
-        self.num_labels = config.num_labels
+        # `num_labels` is a property derived from id2label in transformers 5.x, and
+        # older checkpoints were saved with a literal null. Fall back to id2label
+        # rather than crashing on nn.Linear(..., None).
+        self.num_labels = getattr(config, "num_labels", None) or len(
+            getattr(config, "id2label", None) or {}
+        ) or NUM_LABELS
+        if use_class_weights is None:
+            use_class_weights = getattr(config, "use_class_weights", True)
+        self.use_class_weights = bool(use_class_weights)
+        config.use_class_weights = self.use_class_weights
 
+        self.num_encoding = num_encoding or getattr(config, "num_encoding", "periodic")
+        self.numeric_bin_edges = numeric_bin_edges or getattr(config, "numeric_bin_edges", None)
+        idx = numeric_bin_feature_idx if numeric_bin_feature_idx is not None else getattr(config, "numeric_bin_feature_idx", 1)
+
+        config.num_encoding = self.num_encoding
+        config.numeric_bin_edges = self.numeric_bin_edges
+        config.numeric_bin_feature_idx = idx
         config.base_model_name = self.model_name
         config.num_depts = self.num_depts
         config.num_continuous = self.num_continuous
@@ -112,10 +166,16 @@ class ERPClassifierModel(PreTrainedModel):
         hidden_size = self.encoder.config.hidden_size  # 768 for DistilBERT
         self.text_norm = nn.LayerNorm(hidden_size)
 
-        # 2. Continuous numerical projection branch with periodic encoding
-        # Periodic encoding provides high-frequency resolution around 800 EUR boundary
-        self.periodic_encoding = PeriodicNumericalEncoding(input_dim=self.num_continuous, n_bins=16)
-        periodic_dim = self.periodic_encoding.out_dim  # 2 * (1 + 2*16) = 66
+        # 2. Continuous numerical projection branch.
+        # PLE (default) gives monotone ramps with data-learned edges; the periodic
+        # encoder remains available for the ablation.
+        if self.num_encoding == "ple":
+            self.periodic_encoding = PiecewiseLinearEncoding(
+                self.numeric_bin_edges, feature_idx=idx, input_dim=self.num_continuous
+            )
+        else:
+            self.periodic_encoding = PeriodicNumericalEncoding(input_dim=self.num_continuous, n_bins=16)
+        periodic_dim = self.periodic_encoding.out_dim  # periodic: 2 * (1 + 2*16) = 66
 
         self.num_proj = nn.Sequential(
             nn.Linear(periodic_dim, 64),
@@ -153,11 +213,11 @@ class ERPClassifierModel(PreTrainedModel):
             nn.Linear(128, self.num_labels),
         )
 
-        # Register class_weights as a buffer so it moves to GPU/MPS automatically
-        if class_weights is not None:
-            self.register_buffer("class_weights", class_weights.float())
-        else:
-            self.register_buffer("class_weights", None)
+        # Always register a buffer (ones when unused) so checkpoints saved with and
+        # without class weights load without an UNEXPECTED-key warning.
+        if class_weights is None:
+            class_weights = torch.ones(self.num_labels)
+        self.register_buffer("class_weights", class_weights.float())
 
         self._init_custom_heads()
 
@@ -179,13 +239,14 @@ class ERPClassifierModel(PreTrainedModel):
         num_features: torch.Tensor,
         dept_id: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        sample_weight: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ):
         # Text branch: [B, 768]
         text_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         cls_vec = self.text_norm(text_out.last_hidden_state[:, 0, :])
 
-        # Continuous branch with periodic encoding: [B, 2] -> [B, 66] -> [B, 64]
+        # Continuous branch: [B, 2] -> [B, 18 or 66] -> [B, 64]
         periodic_features = self.periodic_encoding(num_features.float())
         num_vec = self.num_proj(periodic_features)
 
@@ -213,9 +274,27 @@ class ERPClassifierModel(PreTrainedModel):
 
         loss = None
         if labels is not None:
-            # Label smoothing 0.05 to prevent overconfidence
-            loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=0.05)
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1).long())
+            # Label smoothing 0.05 to prevent overconfidence. Class weights are used
+            # only when the checkpoint was trained with them; counterfactual-aware
+            # training instead uses per-sample weights that restore the source prior.
+            weight = self.class_weights if self.use_class_weights else None
+            if sample_weight is not None:
+                per_sample = F.cross_entropy(
+                    logits.view(-1, self.num_labels),
+                    labels.view(-1).long(),
+                    weight=weight,
+                    label_smoothing=0.05,
+                    reduction="none",
+                )
+                w = sample_weight.view(-1).float()
+                loss = (per_sample * w).sum() / w.sum().clamp_min(1e-6)
+            else:
+                loss = F.cross_entropy(
+                    logits.view(-1, self.num_labels),
+                    labels.view(-1).long(),
+                    weight=weight,
+                    label_smoothing=0.05,
+                )
 
         if not return_dict:
             output = (logits,) + text_out[2:]
@@ -227,3 +306,46 @@ class ERPClassifierModel(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
+
+
+def get_device() -> torch.device:
+    """Select CUDA, MPS, or CPU device for inference/evaluation."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def load_model(model_dir: Path, device: torch.device):
+    """Load an ERPClassifierModel, its tokenizer, and scaler statistics from `model_dir`."""
+    model_dir = Path(model_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = ERPClassifierModel.from_pretrained(model_dir)
+    model.to(device).eval()
+
+    with open(model_dir / "scaler.json") as f:
+        scaler = json.load(f)
+    return model, tokenizer, np.array(scaler["mean"]), np.array(scaler["scale"])
+
+
+@torch.no_grad()
+def predict_probs(model, tokenizer, texts, num_features, dept_ids, device, batch_size: int = 64) -> np.ndarray:
+    """Softmax probabilities for parallel lists of inputs."""
+    out = []
+    for i in range(0, len(texts), batch_size):
+        enc = tokenizer(
+            texts[i:i + batch_size],
+            truncation=True,
+            max_length=128,
+            padding=True,
+            return_tensors="pt",
+        ).to(device)
+        logits = model(
+            input_ids=enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            num_features=torch.tensor(np.asarray(num_features[i:i + batch_size]), dtype=torch.float32, device=device),
+            dept_id=torch.tensor(dept_ids[i:i + batch_size], dtype=torch.long, device=device),
+        ).logits
+        out.append(torch.softmax(logits, dim=-1).cpu().numpy())
+    return np.concatenate(out)

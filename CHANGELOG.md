@@ -6,7 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.0] - 2026-10-24
+
+**In short:** The model now handles the 800 EUR line much more cleanly: for the same product, it switches from operating expense to capital expense at the right price and stays there, instead of wobbling around it. We also corrected an earlier number that made the old version look better than it was, and made the test set stricter. Accuracy is 96.5%, the same as a much simpler word-count-plus-price-bucket model, so the reason to use the neural model is the smooth price behaviour, not the headline score.
+
+### Added & Changed
+- **Piecewise-linear amount encoding** (`src/model.py`). The default amount encoder is now `PiecewiseLinearEncoding` (`--num-encoding ple`), replacing `PeriodicNumericalEncoding`. It builds ramps over `log1p(amount)` between bin edges fit on the training data, so a higher amount can only push the score one way. Options: `--bin-strategy quantile|tree` and `--bin-weighting unweighted|weighted`.
+- **Boundaries and counterfactual copies** (`src/boundaries.py`, `src/multimodal_dataset.py`). Boundaries are found by probing `get_gl_account()`, so no threshold is hard-coded. Each amount-sensitive training record gets 4 copies with the amount moved near the boundary and the label recomputed. An original and its k copies each weigh 1/(k+1), which keeps the class mix unchanged (`--class-weight-mode cf`).
+- **Grouped splits and price scrubbing** (`src/multimodal_dataset.py`, `src/text.py`). Records with overlapping titles (token Jaccard of 0.5 or more) stay in the same split, and groups are assigned greedily to even out the labels. The result is 659 original training records plus 644 copies, 141 validation and 141 test records (87 groups in test). Prices written into descriptions are removed at build time and at inference.
+- **Honest sweep metrics** (`src/metrics.py`, `scripts/evaluate.py`, `scripts/evaluate_ensemble.py`, `scripts/baselines.py`). The crossing error is now measured on every case, not only the ones with exactly one flip, and it reports how many cases had a crossing at all. Also new: tolerance-step accuracy (correct everywhere outside a ±2% band), strict sweep accuracy, and group-bootstrap confidence intervals.
+- **Fewer scripts.** The ablation runners are merged into `scripts/run_ablation.py` (`--preset main|weights`), and the old `src/evaluate.py` is gone.
+
+### Fixed
+- **The old crossing number was misleading.** The 0.4% figure for the periodic, no-counterfactual setup in v0.3.0 came from the 1% of cases that had a single flip. Measured on all cases, that setup is off by 15.2% and non-monotone in every case.
+- **Rule parsing** (`src/config.py`). An unreadable `threshold_rule` string now raises a `ValueError`. Before, it silently matched every amount.
+- **Checkpoints and CLI** (`src/model.py`, `train.py`, `classify_erp.py`). The label count and label names are saved properly. `class_weights` is always registered, which removes a warning when loading. A checkpoint must now ship its own preprocessing files, with no silent fallback. `--amount 0` works in one-shot mode, and negative amounts are clamped before `log1p`.
+
+### Results Summary
+- **Default setup** (`D_ple_quantile_cf`, 3 seeds): 96.5% ± 0.6% test accuracy (seed 42: 97.2%). All 8 items near the boundary are correct. The sweep flips exactly once in 100% of cases, is non-monotone in 0%, is right everywhere outside ±2% in 100%, and the first crossing is 0.6% off (range 0.5% to 0.7% across seeds).
+- **Class weights.** Balanced class weights turned out to be the real problem, because they boosted the counterfactual-heavy IT classes about 5x. On config `C`, balanced weights give 39% non-monotone cases on seed 42 (94.3% accuracy). With `cf` weights, `C` is 6% non-monotone on seed 42 and 4% across 3 seeds (95.7% ± 1.5%). On `D`, `cf` and `none` are tied within noise: `cf` gets 96.5% ± 0.6% with a 0.6% crossing (range 0.5% to 0.7%), and `none` gets 96.9% ± 0.3% with a 0.6% crossing (range 0.2% to 1.1%). `none` is steadier on accuracy, `cf` is steadier on the crossing and keeps the source class mix.
+- **Full tables and baseline sweeps:** [`output/evaluation-multimodal/ablation_summary.md`](output/evaluation-multimodal/ablation_summary.md), [`output/evaluation-multimodal/weight_ablation.md`](output/evaluation-multimodal/weight_ablation.md), [`output/evaluation-multimodal/baselines.json`](output/evaluation-multimodal/baselines.json).
+
+---
+
 ## [0.3.0] - 2026-10-23
+
+**In short:** The model got better at reading amounts and learned when to hold back. Accuracy rose from 93.6% to 97.9% on validation, and with a 0.90 confidence cutoff it posted about 94% of the test invoices on its own with no mistakes, sending the rest to a person.
 
 ### Added - Advanced Architectural Upgrades & Production-Ready Confidence Routing
 
@@ -229,6 +254,8 @@ python -m src.evaluate \
 
 ## [0.2.0] - 2026-10-23
 
+**In short:** A bug-fixing release. Five problems were stopping the model from training well or from loading back correctly after being saved. Nothing new was added.
+
 ### Fixed - Critical Bug Fixes and Architectural Improvements
 
 This release addresses 5 critical bugs identified in the initial multimodal architecture that impacted training convergence, threshold learning, and model robustness.
@@ -375,6 +402,8 @@ Epoch 3-7: Slight overfitting, early stopping triggered
 
 ## [0.1.0] - 2026-10-23
 
+**In short:** The first working version. It reads the invoice text, the amount and the department together and picks one of eight GL accounts, with about 93% accuracy on validation.
+
 ### Added - Initial Implementation
 
 #### Multimodal Architecture
@@ -427,4 +456,4 @@ Repository: ERP Classifier
 Description: Multimodal tabular-text classifier for GL account prediction from invoice line items  
 Model: DistilBERT + Tabular MLP Fusion  
 Task: 8-class classification (GL accounts)  
-Dataset: Synthetic ERP invoice data (659 train / 141 val / 142 test)
+Dataset: Synthetic ERP invoice data (659 originals + 644 counterfactuals / 141 val / 141 test)

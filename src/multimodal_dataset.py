@@ -2,15 +2,19 @@
 Multimodal Dataset Builder for ERP GL Account Classification.
 
 Extracts and normalizes:
-- Text features: vendor + description (no hardcoded rules)
+- Text features: vendor + description (explicit price quotes scrubbed)
 - Continuous features: net_amount, log1p(net_amount) with StandardScaler
 - Categorical features: department ID
 
-Key principle: NO business logic or GL classification rules here.
-The model learns thresholds (800 EUR) via backpropagation, not hardcoding.
+The GL rule itself lives in `src/config.py`. This module imports the rule only
+to (a) discover amount boundaries, (b) keep near-duplicates together in the
+split, and (c) generate rule-derived counterfactual amounts. It is therefore
+rule *distillation*, not discovery: the boundary location is an input to the
+training distribution, not something the model has to find from scratch.
 """
 
 import json
+import re
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple
@@ -18,11 +22,12 @@ from dataclasses import dataclass
 from collections import Counter
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 from rich.console import Console
 from rich.table import Table
 
-from .config import GLAccount, LABEL2ID
+from .boundaries import amount_sensitive, counterfactual_amounts, near_boundary
+from .config import LABEL2ID, get_gl_account
+from .text import scrub_record
 
 console = Console()
 
@@ -35,6 +40,7 @@ class MultimodalFeatures:
     dept_id: int
     label: int
     metadata: Dict
+    sample_weight: float = 1.0
 
 
 class DepartmentVocabulary:
@@ -79,6 +85,62 @@ class DepartmentVocabulary:
         # JSON keys are strings, convert back to int
         vocab.id2dept = {int(k): v for k, v in data['id2dept'].items()}
         return vocab
+
+
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _tokens(record: dict) -> frozenset:
+    """Alphanumeric tokens of the (uncorrupted) title, falling back to the description."""
+    text = record.get('title') or record['description']
+    return frozenset(t for t in _WORD_RE.findall(text.lower()) if len(t) > 1)
+
+
+def near_duplicate_groups(records: List[dict], threshold: float = 0.5, max_df: float = 0.05) -> List[int]:
+    """
+    Group records whose titles have token-Jaccard >= threshold (union-find).
+    Candidate pairs come from an inverted index over rare tokens, so cost stays
+    near-linear instead of quadratic. Splitting by group keeps product-family
+    near-duplicates out of both train and test.
+    """
+    toks = [_tokens(r) for r in records]
+    parent = list(range(len(records)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    postings: Dict[str, List[int]] = {}
+    for i, t in enumerate(toks):
+        for w in t:
+            postings.setdefault(w, []).append(i)
+
+    limit = max(2, int(max_df * len(records)))
+    for i, t in enumerate(toks):
+        candidates = set()
+        for w in t:
+            if len(postings[w]) <= limit:
+                candidates.update(postings[w])
+        for j in candidates:
+            if j > i:
+                u = toks[j]
+                if len(t & u) / len(t | u) >= threshold:
+                    parent[find(i)] = find(j)
+
+    return [find(i) for i in range(len(records))]
+
+
+def stratum(record: dict) -> str:
+    """
+    Stratify on label x "near a rule boundary", where the boundary comes from the
+    accounting rules themselves, so every split contains decision-boundary cases.
+    """
+    gl = record['gl_account']
+    gl = gl.value if hasattr(gl, 'value') else str(gl)
+    near = near_boundary(record.get('base_category'), float(record['net_amount_eur']))
+    return f"{gl}|{'boundary' if near else 'other'}"
 
 
 class MultimodalDatasetBuilder:
@@ -127,7 +189,19 @@ class MultimodalDatasetBuilder:
             num_features=num_features,
             dept_id=dept_id,
             label=label,
-            metadata=record.get('metadata', {})
+            metadata={
+                'net_amount_eur': net_amount,
+                'base_category': record.get('base_category'),
+                'language': record.get('language'),
+                'text_style': record.get('text_style'),
+                'seed_id': record.get('seed_id'),
+                'title': record.get('title'),
+                'group_id': record.get('_group_id'),
+                'price_quoted': bool(record.get('price_quoted', False)),
+                'corrupted': record.get('corrupted', False),
+                'counterfactual': record.get('counterfactual', False),
+            },
+            sample_weight=float(record.get('sample_weight', 1.0)),
         )
 
     def fit(self, train_records: List[dict]):
@@ -181,6 +255,10 @@ class MultimodalDatasetBuilder:
         output_dir: Path,
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
+        counterfactuals_per_record: int = 0,
+        bin_strategy: str = "quantile",
+        bin_weighting: str = "unweighted",
+        n_bins: int = 16,
     ) -> Tuple[Path, Path, Path]:
         """
         Build train/val/test splits with multimodal features.
@@ -191,32 +269,29 @@ class MultimodalDatasetBuilder:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Extract labels for stratification
-        labels = [
-            LABEL2ID[r['gl_account'].value if hasattr(r['gl_account'], 'value')
-                     else str(r['gl_account'])]
-            for r in records
-        ]
+        # Scrub explicit price quotes before anything else: the description must not
+        # be an alternative copy of the amount the model is supposed to read from the
+        # numeric branch. The source flag is kept for reporting.
+        records = [scrub_record(r) for r in records]
+        n_quoted = sum(1 for r in records if r.get('price_quoted'))
+        console.print(f"  Scrubbed explicit price quotes from {n_quoted} descriptions")
 
-        # Stratified split
-        console.print(f"\n📂 Creating stratified splits from {len(records)} records...")
+        # Grouped + stratified split: near-duplicate products stay in one split,
+        # and cases near a rule boundary are spread across all splits.
+        console.print(f"\n📂 Creating grouped, stratified splits from {len(records)} records...")
+        groups = np.array(near_duplicate_groups(records))
+        strata = np.array([stratum(r) for r in records])
+        for i, group_id in enumerate(groups):
+            records[i]['_group_id'] = int(group_id)
+        console.print(f"  Near-duplicate groups: {len(set(groups))} (from {len(records)} records)")
 
-        # First split: train vs (val + test)
-        train_records, temp_records, train_labels, temp_labels = train_test_split(
-            records, labels,
-            train_size=train_ratio,
-            stratify=labels,
-            random_state=self.random_seed
+        train_idx, val_idx, test_idx = self._greedy_group_split(
+            records, groups, strata, train_ratio, val_ratio
         )
 
-        # Second split: val vs test
-        val_ratio_adjusted = val_ratio / (val_ratio + (1 - train_ratio - val_ratio))
-        val_records, test_records = train_test_split(
-            temp_records,
-            train_size=val_ratio_adjusted,
-            stratify=temp_labels,
-            random_state=self.random_seed
-        )
+        train_records = [records[i] for i in train_idx]
+        val_records = [records[i] for i in val_idx]
+        test_records = [records[i] for i in test_idx]
 
         console.print(f"  Train: {len(train_records)} ({len(train_records)/len(records)*100:.1f}%)")
         console.print(f"  Val:   {len(val_records)} ({len(val_records)/len(records)*100:.1f}%)")
@@ -224,6 +299,20 @@ class MultimodalDatasetBuilder:
 
         # Fit on training data only
         self.fit(train_records)
+
+        # Counterfactual augmentation (train split only): same text/department, amount
+        # resampled around the rule boundaries, label re-derived from the accounting rules.
+        # Each counterfactual carries weight 1/(k+1) so an original record plus its k
+        # copies count once in the loss; this restores the source class prior instead
+        # of letting the IT classes dominate by construction.
+        if counterfactuals_per_record > 0:
+            family_weight = 1.0 / (counterfactuals_per_record + 1)
+            for rec in train_records:
+                if amount_sensitive(rec.get('base_category')):
+                    rec['sample_weight'] = family_weight
+            train_records = train_records + self.counterfactuals(
+                train_records, counterfactuals_per_record
+            )
 
         # Transform all splits
         console.print("\n🔄 Transforming splits...")
@@ -248,6 +337,7 @@ class MultimodalDatasetBuilder:
                         'num_features': feat.num_features.tolist(),
                         'dept_id': feat.dept_id,
                         'label': feat.label,
+                        'sample_weight': feat.sample_weight,
                         'metadata': feat.metadata,
                     }) + '\n')
 
@@ -264,6 +354,17 @@ class MultimodalDatasetBuilder:
         vocab_path = output_dir / "dept_vocab.json"
         self.dept_vocab.save(vocab_path)
 
+        bins_path = output_dir / "numeric_bins.json"
+        edges = self.fit_bin_edges(train_features, bin_strategy, n_bins, weighting=bin_weighting)
+        with open(bins_path, 'w') as f:
+            json.dump({
+                'strategy': bin_strategy,
+                'weighting': bin_weighting,
+                'feature_idx': 1,
+                'edges': edges,
+            }, f, indent=2)
+        console.print(f"💾 Saved amount bin edges ({bin_strategy}, {len(edges) - 1} bins) to {bins_path}")
+
         console.print(f"💾 Saved scaler to {scaler_path}")
         console.print(f"💾 Saved department vocabulary to {vocab_path}")
 
@@ -271,6 +372,159 @@ class MultimodalDatasetBuilder:
         self._print_distribution(train_features, val_features, test_features)
 
         return train_path, val_path, test_path
+
+    @staticmethod
+    def _greedy_group_split(
+        records: List[dict],
+        groups: np.ndarray,
+        strata: np.ndarray,
+        train_ratio: float,
+        val_ratio: float,
+    ):
+        """
+        Assign whole near-duplicate groups to train/val/test.
+
+        The old fold-concatenation approach was at the mercy of a few very large
+        product-family groups (29-36 near-duplicates), which produced test class
+        counts of 8 against 34 in validation. Greedy assignment processes groups
+        largest-first and penalises the incremental deviation from the target class
+        proportions, so large groups go where there is still capacity. The split is
+        deterministic and independent of the model seed.
+        """
+        ratios = {
+            'train': train_ratio,
+            'val': val_ratio,
+            'test': max(0.0, 1.0 - train_ratio - val_ratio),
+        }
+        n = len(records)
+        target_size = {k: r * n for k, r in ratios.items()}
+        totals = Counter(strata)
+        target = {
+            k: {s: ratios[k] * totals[s] for s in set(strata)}
+            for k in ratios
+        }
+
+        members: Dict[int, List[int]] = {}
+        for i, g in enumerate(groups):
+            members.setdefault(int(g), []).append(i)
+
+        # Largest groups first; group id breaks ties deterministically.
+        order = sorted(members.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        counts = {k: Counter() for k in ratios}
+        sizes = {k: 0 for k in ratios}
+        chosen = {k: [] for k in ratios}
+
+        for gid, idxs in order:
+            group_counts = Counter(strata[i] for i in idxs)
+            scores = {}
+            for split in ratios:
+                class_cost = 0.0
+                for s, c in group_counts.items():
+                    tgt = max(target[split][s], 1.0)
+                    cur = counts[split][s]
+                    class_cost += ((cur + c - tgt) ** 2 - (cur - tgt) ** 2) / tgt
+                tgt_size = max(target_size[split], 1.0)
+                cur_size = sizes[split]
+                size_cost = (
+                    (cur_size + len(idxs) - tgt_size) ** 2 - (cur_size - tgt_size) ** 2
+                ) / tgt_size
+                scores[split] = class_cost + 0.5 * size_cost
+            split = min(scores, key=scores.get)
+            chosen[split].extend(idxs)
+            sizes[split] += len(idxs)
+            for s, c in group_counts.items():
+                counts[split][s] += c
+
+        console.print(
+            "  Grouped split sizes: "
+            + ", ".join(f"{k}={sizes[k]}" for k in ('train', 'val', 'test'))
+        )
+
+        return (
+            np.array(sorted(chosen['train']), dtype=int),
+            np.array(sorted(chosen['val']), dtype=int),
+            np.array(sorted(chosen['test']), dtype=int),
+        )
+
+    def counterfactuals(self, records: List[dict], per_record: int) -> List[dict]:
+        """
+        Re-amounted copies of amount-sensitive records. The GL label comes from the
+        accounting rules (`get_gl_account`), never from a hard-coded threshold, so the
+        model has to read the amount instead of leaning on text style that merely
+        correlates with price.
+
+        The original record and its copies are all down-weighted to 1/(per_record+1)
+        by `build_splits`, so an augmented family has the same total loss weight as
+        one unaugmented record. This keeps the source class prior instead of letting
+        the IT classes dominate by construction.
+        """
+        rng = np.random.default_rng(self.random_seed)
+        out = []
+        for rec in records:
+            cat = rec.get('base_category')
+            if not amount_sensitive(cat):
+                continue
+            for amount in counterfactual_amounts(cat, per_record, rng):
+                new = dict(rec)
+                new['net_amount_eur'] = amount
+                new['gl_account'] = get_gl_account(cat, amount).value
+                new['counterfactual'] = True
+                new['sample_weight'] = 1.0 / (per_record + 1)
+                out.append(new)
+        console.print(
+            f"✓ Added {len(out)} counterfactual samples (train only, weight "
+            f"{1.0/(per_record+1):.2f} each)"
+        )
+        return out
+
+    @staticmethod
+    def _weighted_quantile(x: np.ndarray, q: np.ndarray, w: np.ndarray) -> np.ndarray:
+        """Quantiles of `x` with observation weights `w`."""
+        order = np.argsort(x)
+        x, w = x[order], w[order]
+        cumulative = np.cumsum(w)
+        if cumulative[-1] <= 0:
+            return np.quantile(x, q)
+        cumulative = cumulative / cumulative[-1]
+        return np.interp(q, cumulative, x)
+
+    @staticmethod
+    def fit_bin_edges(
+        train_features: List[MultimodalFeatures],
+        strategy: str,
+        n_bins: int,
+        weighting: str = "unweighted",
+    ) -> List[float]:
+        """
+        Bin edges over the (standardised) log-amount for piecewise-linear encoding,
+        learned from training data only.
+
+        quantile: equal-mass bins. The default is intentionally *unweighted* over
+                  the augmented set, so resolution is allocated around the
+                  counterfactual boundary. `weighting="weighted"` uses the family
+                  weights and therefore follows the source prior instead.
+        tree:     target-aware edges from a shallow decision tree. The tree always
+                  receives the family weights; otherwise the 4x counterfactual IT
+                  copies dominate its split criterion.
+        """
+        if weighting not in ("unweighted", "weighted"):
+            raise ValueError("weighting must be 'unweighted' or 'weighted'")
+        x = np.array([f.num_features[1] for f in train_features], dtype=np.float64)
+        w = np.array([float(f.sample_weight) for f in train_features], dtype=np.float64)
+        if strategy == "tree":
+            from sklearn.tree import DecisionTreeClassifier
+            y = np.array([f.label for f in train_features])
+            tree = DecisionTreeClassifier(max_leaf_nodes=n_bins, min_samples_leaf=5, random_state=0)
+            tree.fit(x.reshape(-1, 1), y, sample_weight=w)
+            inner = tree.tree_.threshold[tree.tree_.feature >= 0]
+        else:
+            q = np.linspace(0, 1, n_bins + 1)[1:-1]
+            inner = (
+                MultimodalDatasetBuilder._weighted_quantile(x, q, w)
+                if weighting == "weighted" else np.quantile(x, q)
+            )
+        edges = np.unique(np.concatenate([[x.min()], inner, [x.max()]]))
+        return [float(e) for e in edges]
 
     def _print_distribution(
         self,
@@ -281,7 +535,8 @@ class MultimodalDatasetBuilder:
         """Print GL account distribution across splits."""
         table = Table(title="\nGL Account Distribution Across Splits", show_header=True)
         table.add_column("GL Account", style="cyan")
-        table.add_column("Train", justify="right", style="green")
+        table.add_column("Train (n)", justify="right", style="green")
+        table.add_column("Train (eff.)", justify="right", style="green")
         table.add_column("Val", justify="right", style="yellow")
         table.add_column("Test", justify="right", style="magenta")
 
@@ -289,6 +544,9 @@ class MultimodalDatasetBuilder:
         id2label = {v: k for k, v in LABEL2ID.items()}
 
         train_counts = Counter(f.label for f in train_features)
+        train_eff = Counter()
+        for f in train_features:
+            train_eff[f.label] += float(f.sample_weight)
         val_counts = Counter(f.label for f in val_features)
         test_counts = Counter(f.label for f in test_features)
 
@@ -299,6 +557,7 @@ class MultimodalDatasetBuilder:
             table.add_row(
                 label_str,
                 str(train_counts.get(label_id, 0)),
+                f"{train_eff.get(label_id, 0.0):.1f}",
                 str(val_counts.get(label_id, 0)),
                 str(test_counts.get(label_id, 0)),
             )

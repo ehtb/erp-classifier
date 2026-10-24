@@ -9,9 +9,9 @@ What this does:
 4. Filter - critic verifies the GL label matches what an LLM would predict zero-shot
 
 After data generation:
-- Use build_multimodal_dataset.py to convert to multimodal format
-- Use train_multimodal.py to train the classifier
-- Use evaluate_multimodal.py to evaluate performance
+- Use scripts/build_dataset.py to convert to multimodal format
+- Use train.py to train the classifier
+- Use scripts/evaluate.py to evaluate performance
 """
 
 import argparse

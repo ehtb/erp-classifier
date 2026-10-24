@@ -1,0 +1,558 @@
+{
+  "data_dir": "output/multimodal",
+  "train_sha256": "f3c493d59ada3ee5",
+  "test_sha256": "51826ab0cc3dc408",
+  "n_test": 141,
+  "without_counterfactuals": {
+    "n_train": 659,
+    "n_test": 141,
+    "sample_weights": true,
+    "majority": {
+      "accuracy": 0.1276595744680851,
+      "ci95": [
+        0.08229767647714942,
+        0.19277246911638168
+      ],
+      "ci95_group_bootstrap": [
+        0.0379722861526659,
+        0.24844904259619977
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 4,
+      "near_boundary_count": 8
+    },
+    "amount+dept GBDT": {
+      "accuracy": 0.6028368794326241,
+      "ci95": [
+        0.5203745403938856,
+        0.6798441812993296
+      ],
+      "ci95_group_bootstrap": [
+        0.5,
+        0.7166666666666667
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 8,
+      "near_boundary_count": 8
+    },
+    "tfidf LR (text only)": {
+      "accuracy": 0.9432624113475178,
+      "ci95": [
+        0.892038495203873,
+        0.9709732362323994
+      ],
+      "ci95_group_bootstrap": [
+        0.9006914893617021,
+        0.9800129870129869
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 6,
+      "near_boundary_count": 8
+    },
+    "tfidf LR (price-stripped)": {
+      "accuracy": 0.9432624113475178,
+      "ci95": [
+        0.892038495203873,
+        0.9709732362323994
+      ],
+      "ci95_group_bootstrap": [
+        0.9006914893617021,
+        0.9800129870129869
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 6,
+      "near_boundary_count": 8
+    },
+    "tfidf+tabular LR": {
+      "accuracy": 0.9432624113475178,
+      "ci95": [
+        0.892038495203873,
+        0.9709732362323994
+      ],
+      "ci95_group_bootstrap": [
+        0.90755606878513,
+        0.9772812075983718
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 6,
+      "near_boundary_count": 8
+    },
+    "sweeps": {
+      "amount+dept GBDT": {
+        "cases": 33,
+        "point_accuracy": 0.9428571428571428,
+        "tight_band_point_accuracy": 0.7647058823529411,
+        "strict_point_accuracy": 0.9428571428571428,
+        "tolerance_band_point_accuracy": 1.0,
+        "tolerance_step_fraction": 1.0,
+        "exactly_one_flip_fraction": 1.0,
+        "non_monotone_fraction": 0.0,
+        "non_monotone_tolerance": 0.05,
+        "step_tolerance_rel": 0.02,
+        "tight_band_rel": 0.0625,
+        "max_negative_step": 1.2951080858600615e-08,
+        "crossing_coverage": 1.0,
+        "crossing_censored_fraction": 0.0,
+        "crossing_starts_above_fraction": 0.0,
+        "median_crossing_rel_error": 0.007341774282783149,
+        "crossing_iqr_rel_error": [
+          0.006251680075980346,
+          0.007341774282783149
+        ],
+        "crossing_rel_errors": [
+          0.007341774282783149,
+          0.006251680075980346,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.006251680075980346,
+          0.006251680075980346,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.006251680075980346,
+          0.007341774282783149,
+          0.006251680075980346,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.006251680075980346,
+          0.006251680075980346,
+          0.006251680075980346,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.006251680075980346,
+          0.007341774282783149,
+          0.007341774282783149,
+          0.006251680075980346,
+          0.006251680075980346,
+          0.007341774282783149,
+          0.007341774282783149
+        ]
+      },
+      "tfidf LR (text only)": {
+        "cases": 33,
+        "point_accuracy": 0.5012987012987012,
+        "tight_band_point_accuracy": 0.49910873440285203,
+        "strict_point_accuracy": 0.4683982683982684,
+        "tolerance_band_point_accuracy": 0.5017976373908577,
+        "tolerance_step_fraction": 0.0,
+        "exactly_one_flip_fraction": 0.0,
+        "non_monotone_fraction": 0.0,
+        "non_monotone_tolerance": 0.05,
+        "step_tolerance_rel": 0.02,
+        "tight_band_rel": 0.0625,
+        "max_negative_step": 0.0,
+        "crossing_coverage": 0.48484848484848486,
+        "crossing_censored_fraction": 0.5151515151515151,
+        "crossing_starts_above_fraction": 0.48484848484848486,
+        "median_crossing_rel_error": 0.4,
+        "crossing_iqr_rel_error": [
+          0.4,
+          0.4
+        ],
+        "crossing_rel_errors": [
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "tfidf LR (price-stripped)": {
+        "cases": 33,
+        "point_accuracy": 0.5012987012987012,
+        "tight_band_point_accuracy": 0.49910873440285203,
+        "strict_point_accuracy": 0.4683982683982684,
+        "tolerance_band_point_accuracy": 0.5017976373908577,
+        "tolerance_step_fraction": 0.0,
+        "exactly_one_flip_fraction": 0.0,
+        "non_monotone_fraction": 0.0,
+        "non_monotone_tolerance": 0.05,
+        "step_tolerance_rel": 0.02,
+        "tight_band_rel": 0.0625,
+        "max_negative_step": 0.0,
+        "crossing_coverage": 0.48484848484848486,
+        "crossing_censored_fraction": 0.5151515151515151,
+        "crossing_starts_above_fraction": 0.48484848484848486,
+        "median_crossing_rel_error": 0.4,
+        "crossing_iqr_rel_error": [
+          0.4,
+          0.4
+        ],
+        "crossing_rel_errors": [
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "tfidf+tabular LR": {
+        "cases": 33,
+        "point_accuracy": 0.8696969696969697,
+        "tight_band_point_accuracy": 0.47771836007130125,
+        "strict_point_accuracy": 0.8696969696969697,
+        "tolerance_band_point_accuracy": 0.9450436569080637,
+        "tolerance_step_fraction": 0.0,
+        "exactly_one_flip_fraction": 1.0,
+        "non_monotone_fraction": 0.48484848484848486,
+        "non_monotone_tolerance": 0.05,
+        "step_tolerance_rel": 0.02,
+        "tight_band_rel": 0.0625,
+        "max_negative_step": 0.32461676970621506,
+        "crossing_coverage": 1.0,
+        "crossing_censored_fraction": 0.0,
+        "crossing_starts_above_fraction": 0.0,
+        "median_crossing_rel_error": 0.0625655813336472,
+        "crossing_iqr_rel_error": [
+          0.06153715026887127,
+          0.06365321967272208
+        ],
+        "crossing_rel_errors": [
+          0.08500275039932888,
+          0.062183901470227315,
+          0.06474827640027997,
+          0.06321913311779284,
+          0.06203697728440929,
+          0.06327429289151752,
+          0.06252031305125712,
+          0.06158553827383059,
+          0.06015373616469802,
+          0.06153715026887127,
+          0.05620517859734392,
+          0.06119901746490527,
+          0.06356024916077117,
+          0.06415594055361154,
+          0.0830662138616644,
+          0.0570201090951231,
+          0.06132562560552586,
+          0.06319685785510729,
+          0.06268073335197044,
+          0.06163229217989013,
+          0.0625655813336472,
+          0.06401235022382068,
+          0.0578878113691043,
+          0.08403853176909479,
+          0.06037059983378242,
+          0.062378513005414506,
+          0.06468844647016653,
+          0.061787564161530216,
+          0.06308266581283618,
+          0.08403041046093108,
+          0.06325945687698763,
+          0.057331001171751834,
+          0.06365321967272208
+        ]
+      }
+    }
+  },
+  "with_counterfactuals": {
+    "n_train": 1303,
+    "n_test": 141,
+    "sample_weights": true,
+    "majority": {
+      "accuracy": 0.1276595744680851,
+      "ci95": [
+        0.08229767647714942,
+        0.19277246911638168
+      ],
+      "ci95_group_bootstrap": [
+        0.0379722861526659,
+        0.24844904259619977
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 4,
+      "near_boundary_count": 8
+    },
+    "amount+dept GBDT": {
+      "accuracy": 0.6524822695035462,
+      "ci95": [
+        0.5707825541896676,
+        0.7260934814244102
+      ],
+      "ci95_group_bootstrap": [
+        0.5531852315394243,
+        0.7619145199063231
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 8,
+      "near_boundary_count": 8
+    },
+    "tfidf LR (text only)": {
+      "accuracy": 0.950354609929078,
+      "ci95": [
+        0.9010731405592894,
+        0.9757467785799635
+      ],
+      "ci95_group_bootstrap": [
+        0.9103448275862069,
+        0.9845020415409195
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 6,
+      "near_boundary_count": 8
+    },
+    "tfidf LR (price-stripped)": {
+      "accuracy": 0.950354609929078,
+      "ci95": [
+        0.9010731405592894,
+        0.9757467785799635
+      ],
+      "ci95_group_bootstrap": [
+        0.9103448275862069,
+        0.9845020415409195
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 6,
+      "near_boundary_count": 8
+    },
+    "tfidf+tabular LR": {
+      "accuracy": 0.9645390070921985,
+      "ci95": [
+        0.9196762460597111,
+        0.9847600484855022
+      ],
+      "ci95_group_bootstrap": [
+        0.9262281329079107,
+        0.9923706847442179
+      ],
+      "n": 141,
+      "n_groups": 87,
+      "near_boundary_correct": 8,
+      "near_boundary_count": 8
+    },
+    "sweeps": {
+      "amount+dept GBDT": {
+        "cases": 33,
+        "point_accuracy": 0.9571428571428572,
+        "tight_band_point_accuracy": 0.8235294117647058,
+        "strict_point_accuracy": 0.9571428571428572,
+        "tolerance_band_point_accuracy": 1.0,
+        "tolerance_step_fraction": 1.0,
+        "exactly_one_flip_fraction": 1.0,
+        "non_monotone_fraction": 0.0,
+        "non_monotone_tolerance": 0.05,
+        "step_tolerance_rel": 0.02,
+        "tight_band_rel": 0.0625,
+        "max_negative_step": 1.1256570231488183e-08,
+        "crossing_coverage": 1.0,
+        "crossing_censored_fraction": 0.0,
+        "crossing_starts_above_fraction": 0.0,
+        "median_crossing_rel_error": 0.006418511737478383,
+        "crossing_iqr_rel_error": [
+          0.006418511737478383,
+          0.0065431928234244196
+        ],
+        "crossing_rel_errors": [
+          0.006418511737478383,
+          0.0065431928234244196,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.0065431928234244196,
+          0.0065431928234244196,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.0065431928234244196,
+          0.006418511737478383,
+          0.0065431928234244196,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.0065431928234244196,
+          0.0065431928234244196,
+          0.0065431928234244196,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.0065431928234244196,
+          0.006418511737478383,
+          0.006418511737478383,
+          0.0065431928234244196,
+          0.0065431928234244196,
+          0.006418511737478383,
+          0.006418511737478383
+        ]
+      },
+      "tfidf LR (text only)": {
+        "cases": 33,
+        "point_accuracy": 0.5012987012987012,
+        "tight_band_point_accuracy": 0.49910873440285203,
+        "strict_point_accuracy": 0.4683982683982684,
+        "tolerance_band_point_accuracy": 0.5017976373908577,
+        "tolerance_step_fraction": 0.0,
+        "exactly_one_flip_fraction": 0.0,
+        "non_monotone_fraction": 0.0,
+        "non_monotone_tolerance": 0.05,
+        "step_tolerance_rel": 0.02,
+        "tight_band_rel": 0.0625,
+        "max_negative_step": 0.0,
+        "crossing_coverage": 0.48484848484848486,
+        "crossing_censored_fraction": 0.5151515151515151,
+        "crossing_starts_above_fraction": 0.48484848484848486,
+        "median_crossing_rel_error": 0.4,
+        "crossing_iqr_rel_error": [
+          0.4,
+          0.4
+        ],
+        "crossing_rel_errors": [
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "tfidf LR (price-stripped)": {
+        "cases": 33,
+        "point_accuracy": 0.5012987012987012,
+        "tight_band_point_accuracy": 0.49910873440285203,
+        "strict_point_accuracy": 0.4683982683982684,
+        "tolerance_band_point_accuracy": 0.5017976373908577,
+        "tolerance_step_fraction": 0.0,
+        "exactly_one_flip_fraction": 0.0,
+        "non_monotone_fraction": 0.0,
+        "non_monotone_tolerance": 0.05,
+        "step_tolerance_rel": 0.02,
+        "tight_band_rel": 0.0625,
+        "max_negative_step": 0.0,
+        "crossing_coverage": 0.48484848484848486,
+        "crossing_censored_fraction": 0.5151515151515151,
+        "crossing_starts_above_fraction": 0.48484848484848486,
+        "median_crossing_rel_error": 0.4,
+        "crossing_iqr_rel_error": [
+          0.4,
+          0.4
+        ],
+        "crossing_rel_errors": [
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4,
+          0.4
+        ]
+      },
+      "tfidf+tabular LR": {
+        "cases": 33,
+        "point_accuracy": 0.9255411255411256,
+        "tight_band_point_accuracy": 0.6934046345811051,
+        "strict_point_accuracy": 0.9255411255411256,
+        "tolerance_band_point_accuracy": 1.0,
+        "tolerance_step_fraction": 1.0,
+        "exactly_one_flip_fraction": 1.0,
+        "non_monotone_fraction": 0.0,
+        "non_monotone_tolerance": 0.05,
+        "step_tolerance_rel": 0.02,
+        "tight_band_rel": 0.0625,
+        "max_negative_step": 0.008927975743886169,
+        "crossing_coverage": 1.0,
+        "crossing_censored_fraction": 0.0,
+        "crossing_starts_above_fraction": 0.0,
+        "median_crossing_rel_error": 0.013434447412603419,
+        "crossing_iqr_rel_error": [
+          0.013035519155236699,
+          0.014240406151223937
+        ],
+        "crossing_rel_errors": [
+          0.015145095458600934,
+          0.012537774270153505,
+          0.014240406151223937,
+          0.012544733064816994,
+          0.012703426765699249,
+          0.013059813567625866,
+          0.012988595386601673,
+          0.013708775268077743,
+          0.013039630709223786,
+          0.013278024600754463,
+          0.014240445739303453,
+          0.014206336755718781,
+          0.012734973390965649,
+          0.01307302798707198,
+          0.01497587553356425,
+          0.013057824530313837,
+          0.013559842390477144,
+          0.013422924374355888,
+          0.013539381298971165,
+          0.013986431471640515,
+          0.01278270054102066,
+          0.013035519155236699,
+          0.014627471779248112,
+          0.0151070828756788,
+          0.0132281546634772,
+          0.012515745940065414,
+          0.013614360853939758,
+          0.015028737142142319,
+          0.01414084781203414,
+          0.01463358252622669,
+          0.013016704941051529,
+          0.014526781169854246,
+          0.013434447412603419
+        ]
+      }
+    }
+  }
+}

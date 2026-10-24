@@ -1,19 +1,21 @@
 """
 Train multimodal tabular-text ERP classifier.
 
-This model learns the 800 EUR threshold natively via backpropagation,
-NOT from hardcoded rules in the data.
+The threshold lives in the accounting rules (`src/config.py`). Training uses
+rule-derived counterfactual amounts to distill that rule into the numeric branch;
+it does not discover the boundary from scratch.
 
 Usage:
-    python train_multimodal.py \
+    python train.py \
         --train-data output/multimodal/train_multimodal.jsonl \
         --val-data output/multimodal/val_multimodal.jsonl \
         --output-dir models/multimodal-classifier \
-        --num-epochs 15
+        --num-epochs 8
 """
 
 import argparse
 import json
+import shutil
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -28,7 +30,7 @@ from transformers import (
     AutoConfig,
     TrainingArguments,
     Trainer,
-    EarlyStoppingCallback,
+    set_seed,
 )
 from transformers.trainer_utils import EvalPrediction
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
@@ -67,16 +69,15 @@ class MultimodalERPDataset(Dataset):
             record['text'],
             truncation=True,
             max_length=self.max_length,
-            padding='max_length',
-            return_tensors='pt',
         )
 
         return {
-            'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'input_ids': torch.tensor(encoding['input_ids'], dtype=torch.long),
+            'attention_mask': torch.tensor(encoding['attention_mask'], dtype=torch.long),
             'num_features': torch.tensor(record['num_features'], dtype=torch.float32),
             'dept_id': torch.tensor(record['dept_id'], dtype=torch.long),
             'labels': torch.tensor(record['label'], dtype=torch.long),
+            'sample_weight': torch.tensor(record.get('sample_weight', 1.0), dtype=torch.float32),
         }
 
 
@@ -84,33 +85,44 @@ class MultimodalERPDataset(Dataset):
 class MultimodalDataCollator:
     """
     Custom data collator for multimodal inputs.
-    Handles text, numerical, and categorical features.
+    Handles text (dynamic padding to the longest sequence in the batch),
+    numerical, and categorical features.
     """
 
+    pad_token_id: int = 0
+
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
+        max_len = max(len(f['input_ids']) for f in features)
+        pad = lambda t, v: torch.nn.functional.pad(t, (0, max_len - len(t)), value=v)
         batch = {
-            'input_ids': torch.stack([f['input_ids'] for f in features]),
-            'attention_mask': torch.stack([f['attention_mask'] for f in features]),
+            'input_ids': torch.stack([pad(f['input_ids'], self.pad_token_id) for f in features]),
+            'attention_mask': torch.stack([pad(f['attention_mask'], 0) for f in features]),
             'num_features': torch.stack([f['num_features'] for f in features]),
             'dept_id': torch.stack([f['dept_id'] for f in features]),
             'labels': torch.stack([f['labels'] for f in features]),
+            'sample_weight': torch.stack([f['sample_weight'] for f in features]),
         }
         return batch
 
 
-def compute_class_weights(train_records: List[Dict], num_labels: int) -> torch.Tensor:
-    """
-    Safely compute balanced class weights even if a class has low/zero support.
-    """
-    labels = [r['label'] for r in train_records]
-    label_counts = Counter(labels)
-
-    console.print("\n📊 Class distribution in Train:")
+def describe_weights(train_records: List[Dict], num_labels: int):
+    """Print raw counts and effective (sample-weighted) class mass."""
+    raw = Counter(r['label'] for r in train_records)
+    mass = Counter()
+    for r in train_records:
+        mass[r['label']] += float(r.get('sample_weight', 1.0))
+    console.print("\n📊 Class distribution in Train (count / effective weight):")
     for label_id in range(num_labels):
         label_name = ID2LABEL.get(label_id, f"Label_{label_id}")
-        count = label_counts.get(label_id, 0)
-        console.print(f"  [{label_id}] {label_name}: {count} samples")
+        console.print(
+            f"  [{label_id}] {label_name}: {raw.get(label_id, 0)} / {mass.get(label_id, 0.0):.1f}"
+        )
+    return raw, mass
 
+
+def compute_class_weights(train_records: List[Dict], num_labels: int) -> torch.Tensor:
+    """Balanced class weights, capped at 5.0 so tiny classes do not explode."""
+    labels = [r['label'] for r in train_records]
     unique_classes = np.unique(labels)
     computed = compute_class_weight(
         class_weight='balanced',
@@ -120,7 +132,6 @@ def compute_class_weights(train_records: List[Dict], num_labels: int) -> torch.T
 
     weights = np.ones(num_labels, dtype=np.float32)
     for cls_id, w in zip(unique_classes, computed):
-        # Cap extreme weights at 5.0 to prevent exploding gradients on tiny classes
         weights[cls_id] = min(float(w), 5.0)
 
     return torch.tensor(weights, dtype=torch.float32)
@@ -160,6 +171,19 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=3e-5)
     parser.add_argument("--tabular-lr", type=float, default=5e-4)
     parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--num-encoding", choices=["ple", "periodic"], default="ple",
+        help="Numeric branch encoding; 'ple' uses the bin edges in numeric_bins.json",
+    )
+    parser.add_argument(
+        "--class-weight-mode", choices=["cf", "balanced", "none"], default="cf",
+        help=(
+            "'cf' (default) uses the per-sample weights written by the dataset builder "
+            "(counterfactual copies count 1/(k+1)) to preserve the source class prior; "
+            "'balanced' and 'none' are kept strictly for the class-weight ablation"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -170,6 +194,8 @@ def main():
     console.print(f"  Epochs: {args.num_epochs}")
     console.print(f"  Batch size: {args.batch_size}")
     console.print(f"  Learning rate: {args.learning_rate}")
+
+    set_seed(args.seed)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -182,27 +208,64 @@ def main():
     console.print(f"  Train: {len(train_dataset)} samples")
     console.print(f"  Val: {len(val_dataset)} samples")
 
-    # Safely count departments across both train and val (+2 buffer for test)
+    # Department embedding size comes from the vocabulary saved by the dataset builder
+    # (includes UNK at 0), the same source evaluation/inference use.
     train_records = train_dataset.records
-    all_records = train_dataset.records + val_dataset.records
-    num_depts = max(r['dept_id'] for r in all_records) + 2
+    data_dir = Path(args.train_data).parent
+    with open(data_dir / "dept_vocab.json") as f:
+        num_depts = len(json.load(f)['dept2id'])
     console.print(f"  Departments embedding size: {num_depts}")
 
-    # Compute class weights to handle imbalance from Critic filter
-    class_weights = compute_class_weights(train_records, NUM_LABELS)
+    # Weighting policy. 'cf' restores the source class prior via the per-sample
+    # weights emitted by the dataset builder; the other modes overwrite them.
+    describe_weights(train_records, NUM_LABELS)
+    if args.class_weight_mode == "balanced":
+        class_weights = compute_class_weights(train_records, NUM_LABELS)
+        for r in train_records:
+            r['sample_weight'] = 1.0
+        use_class_weights = True
+    elif args.class_weight_mode == "none":
+        class_weights = None
+        for r in train_records:
+            r['sample_weight'] = 1.0
+        use_class_weights = False
+    else:  # cf
+        class_weights = None
+        use_class_weights = False
+    console.print(f"  Class-weight mode: {args.class_weight_mode}")
 
     # Create model
     console.print(f"\n🤖 Creating multimodal model...")
     config = AutoConfig.from_pretrained(args.model_name)
-    config.num_labels = NUM_LABELS
+    # `num_labels` is derived from id2label in transformers 5.x; set the real
+    # label names and drop the stale literal so the saved config is unambiguous.
+    config.id2label = {i: ID2LABEL[i] for i in range(NUM_LABELS)}
+    config.label2id = {v: k for k, v in config.id2label.items()}
+    config.__dict__.pop("num_labels", None)
+
+    bin_edges = None
+    if args.num_encoding == "ple":
+        with open(data_dir / "numeric_bins.json") as f:
+            bins = json.load(f)
+        bin_edges, bin_feature_idx = bins['edges'], bins['feature_idx']
+    console.print(f"  Numeric encoding: {args.num_encoding}")
 
     model = ERPClassifierModel(
         config=config,
+        num_encoding=args.num_encoding,
+        numeric_bin_edges=bin_edges,
+        numeric_bin_feature_idx=bin_feature_idx if bin_edges else None,
         model_name=args.model_name,
         num_depts=num_depts,
         num_continuous=2,  # z_score(net_amount), log1p(net_amount)
         class_weights=class_weights,
+        use_class_weights=use_class_weights,
     )
+
+    # transformers 5.x derives `num_labels` from id2label but `to_dict()` reads the
+    # legacy __dict__ entry, which is why earlier checkpoints were saved with a
+    # literal null. Pin it for a self-describing config.
+    model.config.__dict__['num_labels'] = NUM_LABELS
 
     console.print(f"  Architecture:")
     console.print(f"    Text encoder: {args.model_name}")
@@ -243,6 +306,7 @@ def main():
         fp16=torch.cuda.is_available(),
         push_to_hub=False,
         remove_unused_columns=False,
+        seed=args.seed,
     )
 
     # Differential learning rates with no weight decay on bias / LayerNorm
@@ -295,9 +359,10 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=MultimodalDataCollator(),
+        data_collator=MultimodalDataCollator(pad_token_id=tokenizer.pad_token_id),
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+        # No EarlyStoppingCallback: with 8 epochs and patience 5 it never fired.
+        # load_best_model_at_end already restores the best validation checkpoint.
         optimizers=(optimizer_factory(model), None),  # (optimizer, lr_scheduler)
     )
 
@@ -309,6 +374,10 @@ def main():
     console.print(f"\n💾 Saving model to {output_dir}")
     trainer.save_model()
     tokenizer.save_pretrained(output_dir)
+    # Keep preprocessing artifacts next to the checkpoint so inference/eval need no hard-coded paths
+    for name in ("scaler.json", "dept_vocab.json", "numeric_bins.json"):
+        if (data_dir / name).exists():
+            shutil.copy(data_dir / name, output_dir / name)
 
     # Final evaluation
     console.print(f"\n📊 Final validation metrics:")
@@ -330,6 +399,8 @@ def main():
             'learning_rate': args.learning_rate,
             'train_samples': len(train_dataset),
             'val_samples': len(val_dataset),
+            'class_weight_mode': args.class_weight_mode,
+            'use_class_weights': use_class_weights,
             'final_metrics': metrics,
             'total_params': total_params,
             'trainable_params': trainable_params,

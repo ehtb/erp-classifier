@@ -2,8 +2,6 @@
 
 A multimodal ML classifier that predicts GL accounts for ERP transactions by learning from product descriptions, transaction amounts, and department codes together.
 
-**Demo**: [🤗 HuggingFace Dataset](https://huggingface.co/datasets/EHTB/erp-classifier-dataset) | [🤖 Trained Model](https://huggingface.co/EHTB/erp-classifier)
-
 ## The Problem
 
 Amazon Business invoices all show the same vendor name. A €750 monitor and a pack of coffee pods both say "Amazon Services Europe" — the model has to look at department, amount, and description together to classify them correctly.
@@ -12,11 +10,11 @@ IT hardware has a special challenge: it splits across two GL accounts based on p
 - **< 800 EUR** → GL_6220 (operating expense)
 - **≥ 800 EUR** → GL_1400 (capital expenditure)
 
-A €750 monitor and an €850 monitor are the same item, different accounting treatment. Text-only classifiers fail here because they see "[NET_AMT] 799.00" as text tokens, not numbers—they can't learn mathematical thresholds.
+A €750 monitor and an €850 monitor are the same item, different accounting treatment. A text-only classifier scores about 95% on this dataset, because descriptions already hint at the category and price tier. But it never sees the amount. Keep the description the same and it gives the same GL account at €700 and at €900.
 
-## The Solution: Multimodal Architecture (v0.3.0)
+## The Solution: Multimodal Architecture (v0.4.0)
 
-Instead of forcing text models to parse numbers, we treat ERP transactions as **hybrid tabular-text data** with advanced architectural components:
+Instead of forcing text models to parse numbers, we treat ERP transactions as **hybrid tabular-text data** with a dedicated numerical branch:
 
 ```
 ┌─────────────────────────┐      ┌──────────────────────────┐      ┌──────────────────────────┐
@@ -26,15 +24,15 @@ Instead of forcing text models to parse numbers, we treat ERP transactions as **
             │                               │                                   │
             ▼                               ▼                                   ▼
 ┌─────────────────────────┐      ┌──────────────────────────┐      ┌──────────────────────────┐
-│ DistilBERT Encoder      │      │ Embedding Layer          │      │ Periodic Encoding        │
-│ (pretrained)            │      │ dept → 32-dim            │      │ learnable frequencies    │
-│                         │      │ (with 15% UNK dropout)   │      │ 2-dim → 66-dim           │
+│ DistilBERT Encoder      │      │ Embedding Layer          │      │ Piecewise-Linear Encoding│
+│ (pretrained)            │      │ dept → 32-dim            │      │ data-learned bin edges   │
+│                         │      │ (with 15% UNK dropout)   │      │ 2-dim → 2 + 16 ramps     │
 └───────────┬─────────────┘      └──────────┬───────────────┘      └───────────┬──────────────┘
             │                               │                                   │
             │                               │                                   ▼
             │                               │                       ┌──────────────────────────┐
             │                               │                       │ Numerical Projection     │
-            │                               │                       │ 2-layer MLP: 66→64       │
+            │                               │                       │ 2-layer MLP: 18→64       │
             │                               │                       └───────────┬──────────────┘
             │                               │                                   │
             │                               └────────────┬──────────────────────┘
@@ -60,40 +58,42 @@ Instead of forcing text models to parse numbers, we treat ERP transactions as **
             └──────────────────────────────────────────┘
 ```
 
-Architectural features:
+What's new in v0.4.0:
 
-1. Periodic Encoding: Learns high-frequency resolution around the 800 EUR threshold via learnable sin/cos transformations
-2. FiLM Gating: Tabular features (amount + department) modulate text embeddings for department-aware interpretation  
-3. Modality Dropout: 15% dept → UNK during training improves generalization
-4. Label Smoothing: 0.05 entropy regularization prevents overconfidence
-
-The model learns the "< 800 vs ≥ 800" boundary through periodic encoding + backpropagation, not text parsing or hardcoded rules.
+1. **Piecewise-linear amount encoding.** The amount is split into ramps between bin edges taken from the training data. A higher amount can only push the score one way, which keeps the price behaviour smooth. This replaces the older sin/cos encoder as the default.
+2. **Counterfactual training copies.** For each IT record, training adds 4 copies with the amount moved near the 800 EUR line and the label recomputed from the rules (`src/boundaries.py`). An original and its copies share one unit of weight (1/5 each), so a product family still counts once.
+3. **Price scrubbing and grouped splits.** Prices written into descriptions are removed at build time and again at inference (`src/text.py`). Near-duplicate product titles always land in the same split, so the test set can't contain a twin of a training item.
+4. **FiLM gating, department dropout (15%), label smoothing (0.05).** These carry over from earlier versions.
 
 ## Results
 
-### Current Performance (v0.3.0)
+### Current Performance (v0.4.0)
 
-Performance (659 training samples, multimodal architecture with periodic encoding and FiLM gating):
+Results come from 3 training seeds on one fixed split: 659 original training records plus 644 counterfactual copies, 141 validation records and 141 test records (87 product groups in the test set).
 
-- Validation Accuracy: 97.87%
-- Test Accuracy: 97.18%
+- **Test accuracy:** 96.5% ± 0.6% (seed 42: 97.2%; macro F1 0.965; ECE 0.046)
+- **Items within ±12.5% of 800 EUR:** 8 of 8 correct for every seed
+- **Amount sweep** (33 IT test items, 70 amounts each, text held fixed): the prediction flips from OPEX to CAPEX exactly once in 100% of cases and never goes back (0% non-monotone). It is right everywhere outside a ±2% band around the boundary. The first crossing lands 0.60% away from the true boundary (median).
 
-At 0.90 confidence threshold:
-- Auto-post: 133/142 test samples (93.7%) at 100% accuracy
-- Manual review: 9/142 samples (6.3%) - primarily €0 edge cases and low-confidence predictions
-- Zero incorrect auto-posts
+| Model | Test Accuracy | Near-Boundary | Single Flip | Tolerance Step (±2%) | Crossing Error |
+|-------|---------------|---------------|-------------|----------------------|----------------|
+| Majority class | 12.8% | 4/8 | — | — | — |
+| Amount + department (GBDT) | 65.2% | 8/8 | 100% | 100% | 0.6% |
+| TF-IDF + LR (text only) | 95.0% | 6/8 | 0% | 0% | n/a |
+| TF-IDF + binned amount + dept (LR) | 96.5% | 8/8 | 100% | 100% | 1.3% |
+| **Multimodal PLE + CF (default)** | **96.5%** | **8/8** | **100%** | **100%** | **0.6%** |
 
-| Confidence Threshold | Accuracy | Coverage | Status |
-|---------------------|----------|----------|--------|
-| 0.50 | 97.18% | 100% | ⚠ Review needed |
-| 0.70 | 100% | 96.48% | ✓ Aggressive automation |
-| 0.80 | 100% | 95.77% | ✓ Balanced |
-| 0.90 (recommended) | 100% | 93.66% | ✓ Production-ready |
-| 0.95 | 100% | 92.25% | ✓ Maximum confidence |
+The counterfactual copies help the simple binned baseline as well as the neural model. The neural model finds the boundary about twice as precisely (0.6% vs 1.3% error) and is a bit more accurate across the sweep (94.8% vs 92.6%), but the two tie on test accuracy. The simple baseline is much cheaper to run, so the neural model is worth it only if you need the smooth, one-way price behaviour. Full ablation tables are in [`output/evaluation-multimodal/ablation_summary.md`](output/evaluation-multimodal/ablation_summary.md).
+
+### Confidence Routing
+
+The cutoff is the lowest confidence at which validation accuracy reaches 99%. That gives **0.90** (seed 42):
+- **Auto-posted:** 133 of 141 test items (94.3%), all correct
+- **Sent to manual review:** 8 of 141 (5.7%)
 
 ## Quick Start: Using the Trained Model
 
-The repository includes pre-trained weights and demo data. No cloud setup needed.
+The repository includes the pre-generated dataset splits in `output/multimodal/`. Train a checkpoint locally first (see [BUILDING.md](BUILDING.md)), then run the CLI:
 
 ### Install
 
@@ -119,7 +119,7 @@ python classify_erp.py
 # Output:
 # ╭─────────────── Prediction ───────────────╮
 # │ GL_1400_IT_HARDWARE_CAPEX                │
-# │ Confidence: 98.3%                        │
+# │ Confidence: 97.7%                        │
 # ╰──────────────────────────────────────────╯
 ```
 
@@ -152,7 +152,7 @@ Press Ctrl+C or type `quit` to exit interactive mode.
 
 ## Testing the 800 EUR Threshold
 
-Counterfactual Test: Same item, different price → different GL account
+Counterfactual test: same item, different price → different GL account:
 
 ```bash
 # Below threshold (750 EUR) → OPEX
@@ -161,7 +161,7 @@ python classify_erp.py \
   --description "Dell UltraSharp Monitor" \
   --department IT_OPS \
   --amount 750
-# → GL_6220_IT_PERIPHERALS_OPEX (60.5% confidence)
+# → GL_6220_IT_PERIPHERALS_OPEX (97.7% confidence)
 
 # Above threshold (850 EUR) → CAPEX
 python classify_erp.py \
@@ -169,14 +169,14 @@ python classify_erp.py \
   --description "Dell UltraSharp Monitor" \
   --department IT_OPS \
   --amount 850
-# → GL_1400_IT_HARDWARE_CAPEX (98.3% confidence)
+# → GL_1400_IT_HARDWARE_CAPEX (97.7% confidence)
 ```
 
-Identical text ("Dell UltraSharp Monitor"), different amounts → model correctly applies the 800 EUR capitalization rule via learned periodic encoding, not text pattern matching.
+With the text and department unchanged, the prediction moves from `GL_6220` to `GL_1400` within about 1% of the 800 EUR line. Right on the line (800–801 EUR) the model is unsure, at 64–68% confidence, so those cases fall under the 0.90 cutoff and go to manual review.
 
 ## Building and Training
 
-For technical details on training and data generation, see [BUILDING.md](BUILDING.md).
+For technical details on training, ablations, and data generation, see [BUILDING.md](BUILDING.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

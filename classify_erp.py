@@ -21,11 +21,11 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Dict
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -33,6 +33,7 @@ from rich.prompt import Prompt, FloatPrompt
 
 from src.model import ERPClassifierModel
 from src.config import ID2LABEL
+from src.text import scrub_prices
 
 console = Console()
 
@@ -50,6 +51,22 @@ class ERPClassifier:
         self.id2dept = None
 
         self._load_model()
+
+    def _artifact(self, name: str) -> Path:
+        """Preprocessing artifact saved next to the checkpoint.
+
+        No fallback: mixing the scaler/vocabulary of a different dataset build with
+        this checkpoint silently produces wrong probabilities.
+        """
+        path = self.model_dir / name
+        if not path.exists():
+            console.print(f"[red]Error: required artifact not found: {path}[/red]")
+            console.print(
+                "[yellow]The checkpoint must ship with its own scaler/vocabulary. "
+                "Retrain with train.py, which copies them next to the weights.[/yellow]"
+            )
+            sys.exit(1)
+        return path
 
     def _load_model(self):
         """Load model, tokenizer, and auxiliary files."""
@@ -71,11 +88,7 @@ class ERPClassifier:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
 
         # Load scaler
-        scaler_path = Path("output/multimodal/scaler.json")
-        if not scaler_path.exists():
-            console.print(f"[red]Error: Scaler not found: {scaler_path}[/red]")
-            console.print(f"[yellow]Generate data first:[/yellow] python build_multimodal_dataset.py")
-            sys.exit(1)
+        scaler_path = self._artifact("scaler.json")
 
         with open(scaler_path) as f:
             scaler_params = json.load(f)
@@ -83,10 +96,7 @@ class ERPClassifier:
             self.scaler_scale = np.array(scaler_params['scale'])
 
         # Load dept vocab
-        vocab_path = Path("output/multimodal/dept_vocab.json")
-        if not vocab_path.exists():
-            console.print(f"[red]Error: Department vocabulary not found: {vocab_path}[/red]")
-            sys.exit(1)
+        vocab_path = self._artifact("dept_vocab.json")
 
         with open(vocab_path) as f:
             vocab_data = json.load(f)
@@ -97,6 +107,13 @@ class ERPClassifier:
         with console.status("[bold green]Loading model weights..."):
             self.model = ERPClassifierModel.from_pretrained(self.model_dir)
             self.model.eval()
+
+        if self.model.num_labels != len(ID2LABEL):
+            console.print(
+                f"[red]Error: checkpoint has {self.model.num_labels} labels, "
+                f"but the code expects {len(ID2LABEL)}.[/red]"
+            )
+            sys.exit(1)
 
         console.print(f"[bold green]✓ Model loaded successfully![/bold green]\n")
 
@@ -113,8 +130,9 @@ class ERPClassifier:
         Returns:
             dict with keys: gl_account, confidence, all_predictions
         """
-        # Prepare text input
-        text = f"[VENDOR] {vendor} [DESC] {description}"
+        # Prepare text input. Scrub explicit price quotes: training text is scrubbed,
+        # and the amount belongs in the numeric branch, not in the description.
+        text = f"[VENDOR] {vendor} [DESC] {scrub_prices(description)}"
         encoding = self.tokenizer(
             text,
             truncation=True,
@@ -123,8 +141,9 @@ class ERPClassifier:
             return_tensors='pt',
         )
 
-        # Prepare numerical features
-        num_features = np.array([net_amount_eur, np.log1p(net_amount_eur)])
+        # Prepare numerical features (clamp at 0 so negative credit-note amounts do not NaN in log1p)
+        safe_amount = max(0.0, float(net_amount_eur))
+        num_features = np.array([net_amount_eur, np.log1p(safe_amount)])
         num_features = (num_features - self.scaler_mean) / self.scaler_scale
 
         # Prepare department ID
@@ -358,7 +377,7 @@ Examples:
     # Determine mode
     one_shot_args = [args.vendor, args.description, args.department, args.amount]
 
-    if all(one_shot_args):
+    if all(x is not None for x in one_shot_args):
         # One-shot mode
         one_shot_mode(
             classifier,
@@ -368,7 +387,7 @@ Examples:
             args.amount,
             args.show_all
         )
-    elif any(one_shot_args):
+    elif any(x is not None for x in one_shot_args):
         # Partial args provided
         console.print("[red]Error: For one-shot mode, provide all of: --vendor, --description, --department, --amount[/red]")
         sys.exit(1)

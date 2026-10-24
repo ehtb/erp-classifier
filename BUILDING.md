@@ -8,32 +8,37 @@ Technical documentation for generating data and training the multimodal ERP clas
 # Python 3.10+
 pip install -e .
 
+# Dev tools and test suite (pytest, ruff, black)
+pip install -e ".[dev]"
+
 # For AWS Bedrock (optional)
 pip install -e ".[aws]"
 ```
 
 ## Quick Start: Train from Pre-Generated Data
 
-The repository includes demo data (942 samples). Train a model in ~3 minutes:
+The repository includes the source records (`output/03_filtered.jsonl`) and the current demo split (`output/multimodal/`). The split is grouped and stratified: 659 original training records plus 644 rule-derived counterfactual copies, 141 validation, 141 test. Training takes roughly 4 minutes per seed on Apple Silicon:
 
 ```bash
 # Data is already included in output/multimodal/
-# Just train:
 python train.py \
   --train-data output/multimodal/train_multimodal.jsonl \
   --val-data output/multimodal/val_multimodal.jsonl \
   --output-dir models/multimodal-classifier \
-  --num-epochs 10
+  --num-epochs 8
 
 # Evaluate
 python scripts/evaluate.py \
   --model-dir models/multimodal-classifier \
+  --val-data output/multimodal/val_multimodal.jsonl \
   --test-data output/multimodal/test_multimodal.jsonl \
   --output-dir output/evaluation-multimodal
 ```
 
-**Time**: ~3 minutes (training only)  
+**Time**: ~5 minutes (training only)
 **Cost**: $0 (uses existing data)
+
+Weights are not committed (`models/` is gitignored). The quickstart above trains them locally.
 
 ## Generate New Training Data
 
@@ -139,40 +144,64 @@ python scripts/generate_data.py \
 Once you have filtered data, build the multimodal dataset and train:
 
 ```bash
-# Build multimodal dataset
+# Build multimodal dataset (grouped split, price scrubbing, 4 counterfactuals/IT record)
 python scripts/build_dataset.py \
   --input output/run1/03_filtered.jsonl \
   --output-dir output/multimodal
 
-# Train
+# Train (default --class-weight-mode cf preserves the source class prior)
 python train.py \
   --train-data output/multimodal/train_multimodal.jsonl \
   --val-data output/multimodal/val_multimodal.jsonl \
   --output-dir models/multimodal-classifier \
-  --num-epochs 10
+  --num-epochs 8
 
 # Evaluate
 python scripts/evaluate.py \
   --model-dir models/multimodal-classifier \
+  --val-data output/multimodal/val_multimodal.jsonl \
   --test-data output/multimodal/test_multimodal.jsonl \
   --output-dir output/evaluation-multimodal
+```
+
+## Reproducing the Ablations
+
+```bash
+# Main A-E grid (writes output/evaluation-multimodal/ablation_summary.md)
+python scripts/run_ablation.py --seeds 42 43 44
+
+# Class-weight ablation (writes output/evaluation-multimodal/weight_ablation.md)
+python scripts/run_ablation.py --preset weights
+
+# Non-neural baselines (with and without counterfactuals in one file)
+python scripts/baselines.py \
+  --data-dir output/multimodal \
+  --output output/evaluation-multimodal/baselines.json
+
+# Seed ensemble risk-coverage and sweep disagreement
+python scripts/evaluate_ensemble.py \
+  --model-dirs models/ablation/D_ple_quantile_cf/seed42 \
+               models/ablation/D_ple_quantile_cf/seed43 \
+               models/ablation/D_ple_quantile_cf/seed44 \
+  --test-data output/multimodal/test_multimodal.jsonl \
+  --output output/evaluation-multimodal/ensemble.json
 ```
 
 ## Architecture Details
 
 ### Model: ERPClassifierModel
 
-Three-branch fusion architecture (src/model.py):
+Three-branch fusion architecture (`src/model.py`):
 
 ```
 Text Branch (DistilBERT):
   - Input: "[VENDOR] {vendor} [DESC] {description}"
   - Output: 768-dim embedding
 
-Numerical Branch (2-layer MLP):
+Numerical Branch (Piecewise-Linear Encoding + 2-layer MLP):
   - Input: [normalized_amount, log1p(amount)]
+  - PLE: 2 raw features + 16 monotone ramps over bin edges fit on train only
   - Output: 64-dim projection
-  - Learns thresholds (800 EUR) via backpropagation
 
 Categorical Branch (Embedding):
   - Input: department_id (0-5)
@@ -183,49 +212,42 @@ Fusion Classifier:
   - MLP: 864 → 256 → 128 → 8 (GL accounts)
 ```
 
-**Key innovation**: The numerical branch learns the 800 EUR capitalization threshold natively, rather than trying to parse numbers from text tokens.
-
 ### Training Configuration
 
 ```python
-# From train_multimodal.py
-optimizer = AdamW(lr=3e-5, weight_decay=0.01)
-warmup_steps = int(total_steps * 0.1)
+optimizer = AdamW(lr=3e-5 encoder, 5e-4 tabular, weight_decay=0.01)
+warmup_steps = 15% of total steps
 batch_size = 16
-epochs = 10
-early_stopping_patience = 5
-loss = CrossEntropyLoss()
+epochs = 8
+loss = CrossEntropyLoss(label_smoothing=0.05, sample_weight=...)
 ```
 
-**Parameters**:
-- Total: 66.6M (all trainable, full fine-tuning)
-- Training time: ~3 minutes (CPU/MPS)
+- `--class-weight-mode cf` (default): weights each original IT record and its 4 counterfactual copies by $1/5$ to preserve the source class prior; `balanced` and `none` are kept for the ablation.
+- **Parameters**: ~66.8M (all trainable, ~4 minutes per seed on Apple MPS).
 
 ### Data Pipeline
 
-**Synthetic Data Generation** (scripts/generate_data.py):
+**Synthetic Data Generation** (`scripts/generate_data.py`):
 
-1. **Seed Generator**: Combinatorial specs (vendor × dept × language × style × price)
-   - Oversamples 650-950 EUR range 5× for boundary learning
+1. **Seed Generator**: Combinatorial specs (vendor × dept × language × style × price), oversampling 650–950 EUR 5×
 2. **Verbalizer**: LLM generates realistic product descriptions
 3. **Corruptor**: Applies SAP 40-char truncation, PO prefixes, OCR errors
-4. **Critic**: Zero-shot quality filter (pass rate depends on LLM)
+4. **Critic**: Zero-shot quality filter
 5. **Multimodal Transform**: Extract text, normalize numerical features, encode departments
 
-**Multimodal Dataset Builder** (scripts/build_dataset.py):
+**Multimodal Dataset Builder** (`scripts/build_dataset.py`):
 
 ```python
-# Rule-free feature extraction
-text = f"[VENDOR] {vendor} [DESC] {description}"  # No price/dept in text!
+# Text: vendor + description, with explicit price quotes removed at build time
+text = f"[VENDOR] {vendor} [DESC] {scrub_prices(description)}"
 
-# Continuous features
-num_features = [net_amount, log1p(net_amount)]
-num_features = (num_features - mean) / std  # StandardScaler (fit on train only)
+# Continuous features (StandardScaler fit on train only)
+num_features = ([net_amount, log1p(net_amount)] - mean) / std
 
 # Categorical features
 dept_id = dept_vocab[department]  # 0=UNK, 1=ENG, 2=FACILITIES, ...
 
-# Stratified split: 70% train, 15% val, 15% test
+# Split: 70% train, 15% val, 15% test (greedy whole-group assignment by title Jaccard)
 ```
 
 ## Using the Trained Model
@@ -249,28 +271,27 @@ See main [README](README.md) for detailed usage.
 ### Direct Python Integration
 
 ```python
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer
 from src.model import ERPClassifierModel
 from src.config import ID2LABEL
+from src.text import scrub_prices
 import torch, numpy as np, json
 
-# Load artifacts
-tokenizer = AutoTokenizer.from_pretrained("models/multimodal-classifier")
-config = AutoConfig.from_pretrained("models/multimodal-classifier")
+MODEL_DIR = "models/multimodal-classifier"
 
-with open("output/multimodal/scaler.json") as f:
+# train.py copies scaler.json, dept_vocab.json and numeric_bins.json next to the
+# checkpoint; from_pretrained restores num_encoding and the bin edges from config.
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = ERPClassifierModel.from_pretrained(MODEL_DIR).eval()
+
+with open(f"{MODEL_DIR}/scaler.json") as f:
     scaler = json.load(f)
-with open("output/multimodal/dept_vocab.json") as f:
+with open(f"{MODEL_DIR}/dept_vocab.json") as f:
     dept_vocab = json.load(f)['dept2id']
-
-# Load model
-model = ERPClassifierModel(config, "distilbert-base-uncased", len(dept_vocab), 2)
-model.load_state_dict(torch.load("models/multimodal-classifier/model.safetensors"))
-model.eval()
 
 # Predict
 def predict(vendor, description, department, net_amount_eur):
-    text = f"[VENDOR] {vendor} [DESC] {description}"
+    text = f"[VENDOR] {vendor} [DESC] {scrub_prices(description)}"
     encoding = tokenizer(text, truncation=True, max_length=128, 
                          padding='max_length', return_tensors='pt')
     
@@ -357,13 +378,16 @@ DATA_GEN_CONFIG = {
 
 ```
 src/
-├── config.py              # GL taxonomy, model config
+├── config.py              # GL taxonomy, accounting rules, model config
+├── boundaries.py          # Rule boundaries, counterfactual and sweep amounts
+├── metrics.py             # Wilson/group-bootstrap CIs, sweep metrics
+├── text.py                # Explicit price-quote scrubbing
 ├── seed_generator.py      # Combinatorial seed generation
 ├── verbalizer.py          # LLM prompts for product descriptions
 ├── corruptor.py           # ERP corruption patterns
 ├── critic.py              # Zero-shot quality filter
-├── model.py               # ERPClassifierModel (3-branch fusion)
-├── multimodal_dataset.py  # Rule-free feature extraction
+├── model.py               # ERPClassifierModel (PLE + 3-branch fusion)
+├── multimodal_dataset.py  # Grouped split, scrubbing, counterfactuals, weights
 └── llm_client.py          # Unified LLM backend (OpenAI, OpenRouter, Bedrock)
 
 Root scripts:
@@ -373,7 +397,11 @@ Root scripts:
 scripts/ (pipeline tools):
 ├── generate_data.py       # End-to-end data generation pipeline
 ├── build_dataset.py       # Convert JSONL → multimodal splits
-└── evaluate.py            # Test evaluation & metrics
+├── evaluate.py            # Test evaluation, sweep, text ablations
+├── baselines.py           # TF-IDF/GBDT baselines + their amount sweeps
+├── run_ablation.py        # Reproduce the A-E and class-weight ablations
+├── evaluate_ensemble.py   # Seed ensemble risk-coverage and sweep disagreement
+└── summarize_ablation.py  # Markdown aggregation
 ```
 
 ## License

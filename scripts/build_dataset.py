@@ -2,14 +2,17 @@
 Build multimodal dataset from filtered records.
 
 Usage:
-    python build_multimodal_dataset.py \
+    python scripts/build_dataset.py \
         --input output/03_filtered.jsonl \
         --output-dir output/multimodal
 """
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.multimodal_dataset import MultimodalDatasetBuilder
 from rich.console import Console
@@ -44,10 +47,36 @@ def main():
         help="Validation set ratio"
     )
     parser.add_argument(
+        "--counterfactuals-per-record",
+        type=int,
+        default=4,
+        help=(
+            "Re-amounted copies per amount-sensitive training record (train split only; "
+            "0 disables). Originals and copies are weighted 1/(k+1)."
+        )
+    )
+    parser.add_argument(
+        "--bin-strategy",
+        choices=["quantile", "tree"],
+        default="quantile",
+        help="How amount bin edges for the piecewise-linear encoder are learned"
+    )
+    parser.add_argument(
+        "--bin-weighting",
+        choices=["unweighted", "weighted"],
+        default="unweighted",
+        help=(
+            "Quantile bin weighting over the augmented train set. 'unweighted' "
+            "(default) concentrates resolution around the counterfactual boundary; "
+            "'weighted' follows the source class/amount prior. Tree bins always "
+            "use the family weights."
+        )
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed"
+        help="Seed for counterfactual amount sampling (the group split is deterministic)"
     )
 
     args = parser.parse_args()
@@ -73,6 +102,9 @@ def main():
         output_dir=Path(args.output_dir),
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
+        counterfactuals_per_record=args.counterfactuals_per_record,
+        bin_strategy=args.bin_strategy,
+        bin_weighting=args.bin_weighting,
     )
 
     console.print(f"\n[bold green]✓ Multimodal dataset created successfully![/bold green]")
