@@ -38,7 +38,7 @@ from sklearn.utils.class_weight import compute_class_weight
 from rich.console import Console
 
 from src.model import ERPClassifierModel
-from src.config import NUM_LABELS, ID2LABEL
+from src.config import NUM_LABELS, ID2LABEL, MODEL_CONFIG
 
 console = Console()
 
@@ -111,7 +111,7 @@ def describe_weights(train_records: List[Dict], num_labels: int):
     mass = Counter()
     for r in train_records:
         mass[r['label']] += float(r.get('sample_weight', 1.0))
-    console.print("\n📊 Class distribution in Train (count / effective weight):")
+    console.print("\nClass distribution in Train (count / effective weight):")
     for label_id in range(num_labels):
         label_name = ID2LABEL.get(label_id, f"Label_{label_id}")
         console.print(
@@ -165,12 +165,12 @@ def main():
     parser.add_argument("--train-data", type=str, required=True)
     parser.add_argument("--val-data", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="models/multimodal-classifier")
-    parser.add_argument("--model-name", type=str, default="distilbert-base-uncased")
-    parser.add_argument("--num-epochs", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--learning-rate", type=float, default=3e-5)
-    parser.add_argument("--tabular-lr", type=float, default=5e-4)
-    parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--model-name", type=str, default=MODEL_CONFIG["base_model"])
+    parser.add_argument("--num-epochs", type=int, default=MODEL_CONFIG["num_epochs"])
+    parser.add_argument("--batch-size", type=int, default=MODEL_CONFIG["batch_size"])
+    parser.add_argument("--learning-rate", type=float, default=MODEL_CONFIG["learning_rate"])
+    parser.add_argument("--tabular-lr", type=float, default=MODEL_CONFIG["tabular_lr"])
+    parser.add_argument("--max-length", type=int, default=MODEL_CONFIG["max_length"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--num-encoding", choices=["ple", "periodic"], default="ple",
@@ -201,7 +201,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
     # Create datasets
-    console.print("\n📂 Loading datasets...")
+    console.print("\nLoading datasets...")
     train_dataset = MultimodalERPDataset(Path(args.train_data), tokenizer, args.max_length)
     val_dataset = MultimodalERPDataset(Path(args.val_data), tokenizer, args.max_length)
 
@@ -235,7 +235,7 @@ def main():
     console.print(f"  Class-weight mode: {args.class_weight_mode}")
 
     # Create model
-    console.print(f"\n🤖 Creating multimodal model...")
+    console.print("\nCreating multimodal model...")
     config = AutoConfig.from_pretrained(args.model_name)
     # `num_labels` is derived from id2label in transformers 5.x; set the real
     # label names and drop the stale literal so the saved config is unambiguous.
@@ -282,9 +282,10 @@ def main():
     # Training arguments
     output_dir = Path(args.output_dir)
 
-    # Calculate warmup steps (15% of total training steps for smoother annealing)
+    # Calculate warmup steps from MODEL_CONFIG warmup_ratio (default 15%)
     total_steps = (len(train_dataset) // args.batch_size) * args.num_epochs
-    warmup_steps = int(total_steps * 0.15)
+    warmup_steps = int(total_steps * MODEL_CONFIG["warmup_ratio"])
+    weight_decay = MODEL_CONFIG["weight_decay"]
 
     training_args = TrainingArguments(
         output_dir=str(output_dir),
@@ -294,7 +295,7 @@ def main():
         learning_rate=args.learning_rate,
         warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
-        weight_decay=0.01,
+        weight_decay=weight_decay,
         logging_steps=20,
         eval_strategy="epoch",
         save_strategy="epoch",
@@ -347,7 +348,7 @@ def main():
             },
         ]
 
-        console.print(f"\n⚙️  Differential learning rates configured:")
+        console.print("\nDifferential learning rates configured:")
         console.print(f"  Encoder (DistilBERT): {args.learning_rate}")
         console.print(f"  Tabular & Fusion heads: {args.tabular_lr} (0.0 weight decay on threshold biases)")
 
@@ -367,11 +368,11 @@ def main():
     )
 
     # Train
-    console.print(f"\n🚀 Starting training...\n")
+    console.print("\nStarting training...\n")
     train_result = trainer.train()
 
     # Save
-    console.print(f"\n💾 Saving model to {output_dir}")
+    console.print(f"\nSaving model to {output_dir}")
     trainer.save_model()
     tokenizer.save_pretrained(output_dir)
     # Keep preprocessing artifacts next to the checkpoint so inference/eval need no hard-coded paths
@@ -380,13 +381,13 @@ def main():
             shutil.copy(data_dir / name, output_dir / name)
 
     # Final evaluation
-    console.print(f"\n📊 Final validation metrics:")
+    console.print("\nFinal validation metrics:")
     metrics = trainer.evaluate()
     for key, value in metrics.items():
         if key.startswith('eval_'):
             console.print(f"  {key.replace('eval_', '')}: {value:.4f}")
 
-    console.print(f"\n[bold green]✓ Training complete![/bold green]")
+    console.print("\n[bold green]Training complete.[/bold green]")
     console.print(f"  Model saved to: {output_dir}")
 
     # Save training summary

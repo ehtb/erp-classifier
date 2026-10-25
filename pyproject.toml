@@ -1,6 +1,6 @@
 [project]
 name = "erp-classifier"
-version = "0.4.0"
+version = "0.5.0"
 description = "Synthetic data generation and fine-tuning pipeline for ERP GL account classification"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,16 +14,20 @@ dependencies = [
     "rich>=13.7.0",
     "tqdm>=4.66.0",
     "matplotlib>=3.8.0",
-    "seaborn>=0.13.0",
     "accelerate>=0.27.0",
-    "bitsandbytes>=0.42.0",
     "requests>=2.31.0",
     "huggingface-hub>=0.20.0",
     "python-dotenv>=1.0.0",
     "openai>=1.0.0",
 ]
 
+[project.scripts]
+erp-classify = "classify_erp:main"
+
 [project.optional-dependencies]
+demo = [
+    "gradio>=4.0.0",
+]
 aws = [
     "boto3>=1.34.0",
 ]
@@ -36,7 +40,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+only-include = ["src", "classify_erp.py"]
 
 [build-system]
 requires = ["hatchling"]

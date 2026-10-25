@@ -107,6 +107,11 @@ class ERPClassifierModel(PreTrainedModel):
         """Return tied weights keys (required by newer transformers)."""
         return {}
 
+    @property
+    def num_encoder(self) -> nn.Module:
+        """Numeric branch encoder (PiecewiseLinearEncoding or PeriodicNumericalEncoding)."""
+        return self.periodic_encoding
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         # When loading from checkpoint, don't re-download the encoder
@@ -155,30 +160,30 @@ class ERPClassifierModel(PreTrainedModel):
         config.num_continuous = self.num_continuous
 
         # 1. Text encoder branch
-        encoder_config = AutoConfig.from_pretrained(self.model_name)
         if load_pretrained_encoder:
             # Training from scratch - load pretrained weights
             self.encoder = AutoModel.from_pretrained(self.model_name)
         else:
-            # Loading from checkpoint - use from_config, state_dict will load weights
-            self.encoder = AutoModel.from_config(encoder_config)
+            # Loading from checkpoint - use config directly, state_dict will load weights
+            self.encoder = AutoModel.from_config(config)
 
         hidden_size = self.encoder.config.hidden_size  # 768 for DistilBERT
         self.text_norm = nn.LayerNorm(hidden_size)
 
         # 2. Continuous numerical projection branch.
         # PLE (default) gives monotone ramps with data-learned edges; the periodic
-        # encoder remains available for the ablation.
+        # encoder remains available for the ablation. Attribute name `periodic_encoding`
+        # is preserved for checkpoint state_dict compatibility; use `self.num_encoder`.
         if self.num_encoding == "ple":
             self.periodic_encoding = PiecewiseLinearEncoding(
                 self.numeric_bin_edges, feature_idx=idx, input_dim=self.num_continuous
             )
         else:
             self.periodic_encoding = PeriodicNumericalEncoding(input_dim=self.num_continuous, n_bins=16)
-        periodic_dim = self.periodic_encoding.out_dim  # periodic: 2 * (1 + 2*16) = 66
+        encoded_num_dim = self.num_encoder.out_dim  # ple: 2 + 16 = 18; periodic: 2 * (1 + 2*16) = 66
 
         self.num_proj = nn.Sequential(
-            nn.Linear(periodic_dim, 64),
+            nn.Linear(encoded_num_dim, 64),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(64, 64),
@@ -232,6 +237,54 @@ class ERPClassifierModel(PreTrainedModel):
 
         nn.init.normal_(self.dept_emb.weight, mean=0.0, std=0.02)
 
+    def _encode_and_fuse(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_features: torch.Tensor,
+        dept_id: torch.Tensor,
+    ) -> dict:
+        """Shared multimodal forward path returning logits and intermediate branch tensors."""
+        # Text branch: [B, 768]
+        text_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        cls_raw = self.text_norm(text_out.last_hidden_state[:, 0, :])
+
+        # Continuous branch: [B, 2] -> [B, 18 or 66] -> [B, 64]
+        encoded_num = self.num_encoder(num_features.float())
+        num_vec = self.num_proj(encoded_num)
+
+        # Categorical branch with modality dropout (15% -> UNK during training)
+        dept_id_input = dept_id.long()
+        if self.training:
+            mask = torch.rand(dept_id_input.shape[0], device=dept_id_input.device) < self.modality_dropout_p
+            dept_id_input = dept_id_input.masked_fill(mask, 0)
+
+        dept_vec = self.dept_norm(self.dept_act(self.dept_emb(dept_id_input)))
+
+        # FiLM gating: tabular features modulate text embeddings
+        tabular_vec = torch.cat([num_vec, dept_vec], dim=-1)  # [B, 96]
+        film_params = self.film_gate(tabular_vec)  # [B, 1536]
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)  # [B, 768] each
+        scale = 1.0 + torch.tanh(gamma)
+
+        # Modulate: cls_raw * (1 + tanh(gamma)) + beta
+        cls_mod = cls_raw * scale + beta
+
+        # Multimodal fusion: [B, 864] -> [B, num_labels]
+        fused = torch.cat([cls_mod, num_vec, dept_vec], dim=-1)
+        logits = self.classifier(fused)
+
+        return {
+            "logits": logits,
+            "text_out": text_out,
+            "cls_raw": cls_raw,
+            "cls_mod": cls_mod,
+            "scale": scale,
+            "beta": beta,
+            "num_vec": num_vec,
+            "dept_vec": dept_vec,
+        }
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -242,35 +295,14 @@ class ERPClassifierModel(PreTrainedModel):
         sample_weight: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ):
-        # Text branch: [B, 768]
-        text_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        cls_vec = self.text_norm(text_out.last_hidden_state[:, 0, :])
-
-        # Continuous branch: [B, 2] -> [B, 18 or 66] -> [B, 64]
-        periodic_features = self.periodic_encoding(num_features.float())
-        num_vec = self.num_proj(periodic_features)
-
-        # Categorical branch with modality dropout (15% -> UNK during training)
-        dept_id_input = dept_id.long()
-        if self.training:
-            # Randomly mask dept_id to 0 (UNK) with 15% probability
-            mask = torch.rand(dept_id_input.shape[0], device=dept_id_input.device) < self.modality_dropout_p
-            dept_id_input = dept_id_input.masked_fill(mask, 0)
-
-        dept_vec = self.dept_norm(self.dept_act(self.dept_emb(dept_id_input)))
-
-        # FiLM gating: tabular features modulate text embeddings
-        # gamma, beta = split(tabular -> 2*hidden_size)
-        tabular_vec = torch.cat([num_vec, dept_vec], dim=-1)  # [B, 96]
-        film_params = self.film_gate(tabular_vec)  # [B, 1536]
-        gamma, beta = torch.chunk(film_params, 2, dim=-1)  # [B, 768] each
-
-        # Modulate: cls_vec * (1 + tanh(gamma)) + beta
-        cls_vec = cls_vec * (1.0 + torch.tanh(gamma)) + beta
-
-        # Multimodal fusion: [B, 864] -> [B, num_labels]
-        fused = torch.cat([cls_vec, num_vec, dept_vec], dim=-1)
-        logits = self.classifier(fused)
+        out = self._encode_and_fuse(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            num_features=num_features,
+            dept_id=dept_id,
+        )
+        logits = out["logits"]
+        text_out = out["text_out"]
 
         loss = None
         if labels is not None:
@@ -306,6 +338,37 @@ class ERPClassifierModel(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
+
+    @torch.no_grad()
+    def forward_with_diagnostics(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_features: torch.Tensor,
+        dept_id: torch.Tensor,
+    ) -> dict:
+        """Run inference and return probabilities alongside FiLM modulation diagnostics."""
+        out = self._encode_and_fuse(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            num_features=num_features,
+            dept_id=dept_id,
+        )
+        logits = out["logits"]
+        probs = torch.softmax(logits, dim=-1)
+        cls_raw = out["cls_raw"]
+        cls_mod = out["cls_mod"]
+
+        rel_shift = (cls_mod - cls_raw).norm(dim=-1) / cls_raw.norm(dim=-1).clamp_min(1e-6)
+        return {
+            "logits": logits,
+            "probs": probs,
+            "film_scale_mean": out["scale"].mean(dim=-1),
+            "film_shift_norm": out["beta"].norm(dim=-1),
+            "relative_text_modulation": rel_shift,
+            "num_vec_norm": out["num_vec"].norm(dim=-1),
+            "dept_vec_norm": out["dept_vec"].norm(dim=-1),
+        }
 
 
 def get_device() -> torch.device:

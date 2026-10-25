@@ -7,6 +7,7 @@ Reports, beyond plain accuracy:
   - Amount sweep: every amount-sensitive test description re-scored around each
     rule boundary with text and department held fixed
   - Confidence cut-off selected on the validation set, then reported once on test
+  - Boundary-crossing curve plot (`sweep_curve.png`, or `boundary_sweep.png` with `--compare-model-dir`)
 
 Boundaries are discovered from the accounting rules (src/boundaries.py); nothing
 about a specific threshold is hard-coded here.
@@ -24,6 +25,10 @@ import json
 import sys
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from rich.console import Console
 from rich.table import Table
@@ -129,7 +134,7 @@ def evaluate_text_variant(model, tokenizer, records, texts, device):
 
 def amount_sweep(model, tokenizer, records, scaler_mean, scaler_scale, device,
                  mono_tol: float = 0.05, step_tol_rel: float = DEFAULT_STEP_TOL_REL,
-                 band_edges=None):
+                 band_edges=None, return_curves: bool = False):
     """
     Re-score each amount-sensitive test description around each rule boundary with
     text and department fixed. The two accounts either side of the boundary should
@@ -145,6 +150,7 @@ def amount_sweep(model, tokenizer, records, scaler_mean, scaler_scale, device,
     """
     cases = []
     single_flip_errors = []
+    curve_data = []
 
     for r in records:
         cat = r['metadata'].get('base_category')
@@ -170,6 +176,12 @@ def amount_sweep(model, tokenizer, records, scaler_mean, scaler_scale, device,
             case['boundary'] = b.amount
             case['strict_correct'] = int(strict.sum())
             cases.append(case)
+            curve_data.append({
+                'amounts': amounts,
+                'p_hi': p_hi,
+                'max_prob': probs.max(-1),
+                'boundary': b.amount,
+            })
             if case['one_flip'] and case['crossing'] is not None:
                 single_flip_errors.append(
                     abs(case['crossing'] - b.amount) / b.amount
@@ -181,7 +193,147 @@ def amount_sweep(model, tokenizer, records, scaler_mean, scaler_scale, device,
         float(np.median(single_flip_errors)) if single_flip_errors else None
     )
     agg['single_flip_crossing_coverage'] = len(single_flip_errors) / max(len(cases), 1)
+    if return_curves:
+        return agg, curve_data
     return agg
+
+
+def _panel_title_for_model(model_dir: Path, model, override: str = None) -> str:
+    """Derive a descriptive panel title from the checkpoint path and model config."""
+    if override:
+        return override
+    parts = set(model_dir.parts)
+    if "D_ple_quantile_cf" in parts or model_dir.name == "multimodal-classifier":
+        return "v0.4.0 Default (Piecewise-Linear + Counterfactuals)"
+    if "A_periodic_nocf" in parts:
+        return "v0.3.0 Baseline (Periodic Encoding, No Counterfactuals)"
+    enc = getattr(model, "num_encoding", "ple")
+    enc_label = "Piecewise-Linear" if enc == "ple" else "Periodic Encoding"
+    label = model_dir.parent.name if model_dir.name.startswith("seed") else model_dir.name
+    return f"{label} ({enc_label})"
+
+
+def plot_boundary_sweep(
+    output_path: Path,
+    primary_sweep: dict,
+    primary_curves: list,
+    primary_title: str = "Primary Model",
+    compare_sweep: dict = None,
+    compare_curves: list = None,
+    compare_title: str = "Comparison Model",
+    step_tol_rel: float = DEFAULT_STEP_TOL_REL,
+):
+    """Save a boundary-crossing figure showing P(above) across EUR amounts for each rule boundary."""
+    if not primary_curves:
+        return
+
+    panels = []
+    if compare_curves:
+        panels.append((compare_title, compare_sweep or {}, compare_curves, "#c0392b", "#e74c3c"))
+    panels.append((primary_title, primary_sweep or {}, primary_curves, "#0f62fe", "#4589ff"))
+
+    distinct_boundaries = sorted({float(c['boundary']) for c in primary_curves})
+    n_rows = len(distinct_boundaries)
+    n_cols = len(panels)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(12.5 if n_cols == 2 else 6.8, 4.8 * n_rows),
+        sharey=True,
+        squeeze=False,
+        dpi=180,
+    )
+
+    for row_idx, boundary in enumerate(distinct_boundaries):
+        for col_idx, (title, sw, curves, dark_color, trace_color) in enumerate(panels):
+            ax = axes[row_idx][col_idx]
+            b_curves = [c for c in curves if abs(float(c['boundary']) - boundary) < 1e-6]
+            if not b_curves:
+                ax.set_visible(False)
+                continue
+
+            amounts = np.asarray(b_curves[0]['amounts'], dtype=float)
+            mat = np.stack([np.asarray(c['p_hi'], dtype=float) for c in b_curves], axis=0)
+            median_curve = np.median(mat, axis=0)
+            q25 = np.percentile(mat, 25, axis=0)
+            q75 = np.percentile(mat, 75, axis=0)
+
+            ideal = (amounts >= boundary).astype(float)
+            ax.step(
+                amounts, ideal, where="post", color="#1f2937", linestyle=":", linewidth=1.4,
+                label=f"Accounting rule (step at {boundary:g} EUR)", zorder=2,
+            )
+
+            tol_lo = boundary * (1 - step_tol_rel)
+            tol_hi = boundary * (1 + step_tol_rel)
+            ax.axvspan(
+                tol_lo, tol_hi, color="#f59e0b", alpha=0.16,
+                label=f"±{step_tol_rel:.1%} boundary band (manual review zone)",
+            )
+            ax.axvline(boundary, color="#111827", linestyle="--", linewidth=1.1, alpha=0.8)
+            ax.axhline(0.5, color="#6b7280", linestyle="--", linewidth=0.9, alpha=0.6)
+
+            for i, row in enumerate(mat):
+                ax.plot(
+                    amounts, row,
+                    color=trace_color, alpha=0.20, linewidth=0.9,
+                    label=f"{len(mat)} test items (text fixed)" if i == 0 else None,
+                    zorder=3,
+                )
+
+            ax.fill_between(amounts, q25, q75, color=dark_color, alpha=0.18, zorder=4)
+            ax.plot(
+                amounts, median_curve, color=dark_color, linewidth=2.4,
+                label="Median P(above) + IQR", zorder=5,
+            )
+
+            one_flip = (sw.get("exactly_one_flip_fraction") or 0.0) * 100
+            non_mono = (sw.get("non_monotone_fraction") or 0.0) * 100
+            cross_err = sw.get("median_crossing_rel_error")
+            cross_str = f"{cross_err * 100:.1f}%" if cross_err is not None else "n/a"
+
+            stats_box = (
+                f"Single flip:     {one_flip:.0f}%\n"
+                f"Non-monotone:    {non_mono:.0f}%\n"
+                f"Crossing error:  {cross_str}"
+            )
+            ax.text(
+                0.04, 0.78, stats_box,
+                transform=ax.transAxes,
+                fontsize=8.8,
+                family="monospace",
+                verticalalignment="top",
+                bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="#d1d5db", alpha=0.94),
+                zorder=6,
+            )
+
+            panel_title = title if n_rows == 1 else f"{title} ({boundary:g} EUR boundary)"
+            ax.set_title(panel_title, fontsize=10.5, fontweight="bold", pad=10)
+            ax.set_xlabel("Invoice Net Amount (EUR, text & department held fixed)", fontsize=9.5)
+            ax.set_xlim(amounts.min(), amounts.max())
+            ax.set_ylim(-0.04, 1.04)
+            ax.grid(True, linestyle="-", alpha=0.22)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        axes[row_idx][0].set_ylabel(f"P(>= {boundary:g} EUR account)", fontsize=9.5)
+        axes[row_idx][-1].legend(
+            loc="lower right", frameon=True, fontsize=8.3, facecolor="white", framealpha=0.92
+        )
+
+    header_bound = (
+        f"the {distinct_boundaries[0]:g} EUR Capitalization Boundary"
+        if len(distinct_boundaries) == 1
+        else "Rule Decision Boundaries"
+    )
+    fig.suptitle(
+        f"Counterfactual Price Sweep Across {header_bound}",
+        fontsize=12, fontweight="bold", y=0.99,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main():
@@ -190,6 +342,14 @@ def main():
     parser.add_argument("--val-data", type=str, required=True)
     parser.add_argument("--test-data", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="output/evaluation-multimodal")
+    parser.add_argument("--compare-model-dir", type=str, default=None,
+                        help="Optional baseline checkpoint to plot alongside --model-dir in boundary_sweep.png")
+    parser.add_argument("--primary-label", type=str, default=None,
+                        help="Optional subplot title for --model-dir in the sweep plot")
+    parser.add_argument("--compare-label", type=str, default=None,
+                        help="Optional subplot title for --compare-model-dir in the sweep plot")
+    parser.add_argument("--sweep-plot", type=str, default=None,
+                        help="Filename for the sweep plot inside --output-dir (default: boundary_sweep.png when comparing, sweep_curve.png otherwise)")
     parser.add_argument("--mono-tolerance", type=float, default=0.05,
                         help="Max allowed negative step in p(above) before a case is non-monotone")
     parser.add_argument("--step-tolerance", type=float, default=DEFAULT_STEP_TOL_REL,
@@ -204,7 +364,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     device = get_device()
 
-    console.print(f"🤖 Loading model from {args.model_dir}...")
+    console.print(f"Loading model from {args.model_dir}...")
     model, tokenizer, scaler_mean, scaler_scale = load_model(Path(args.model_dir), device)
     band_edges = load_price_band_edges(Path(args.model_dir))  # None for a single-stage model
     if band_edges is not None:
@@ -284,10 +444,10 @@ def main():
         console.print(f"  {key:<24} {t['correct']}/{t['count']}  acc={acc_s}")
 
     # Amount sweep
-    sweep = amount_sweep(
+    sweep, primary_curves = amount_sweep(
         model, tokenizer, test_records, scaler_mean, scaler_scale, device,
         mono_tol=args.mono_tolerance, step_tol_rel=args.step_tolerance,
-        band_edges=band_edges,
+        band_edges=band_edges, return_curves=True,
     )
     console.print("\n[bold]Amount sweep (text/department fixed, amount varied around each boundary):[/bold]")
     console.print(f"  cases: {sweep['cases']}  point accuracy: {sweep['point_accuracy']:.3f}  "
@@ -310,6 +470,34 @@ def main():
         console.print(f"  single-flip crossing error: {sweep['single_flip_crossing_rel_error']:.2%} "
                       f"(coverage {sweep['single_flip_crossing_coverage']:.0%})")
 
+    primary_title = _panel_title_for_model(Path(args.model_dir), model, args.primary_label)
+    compare_sweep, compare_curves, compare_title = None, None, "Comparison Model"
+    if args.compare_model_dir:
+        cmp_dir = Path(args.compare_model_dir)
+        console.print(f"\nLoading comparison model from {cmp_dir} for sweep figure...")
+        cmp_model, cmp_tok, cmp_mean, cmp_scale = load_model(cmp_dir, device)
+        cmp_edges = load_price_band_edges(cmp_dir)
+        compare_title = _panel_title_for_model(cmp_dir, cmp_model, args.compare_label)
+        compare_sweep, compare_curves = amount_sweep(
+            cmp_model, cmp_tok, test_records, cmp_mean, cmp_scale, device,
+            mono_tol=args.mono_tolerance, step_tol_rel=args.step_tolerance,
+            band_edges=cmp_edges, return_curves=True,
+        )
+
+    plot_name = args.sweep_plot or ("boundary_sweep.png" if args.compare_model_dir else "sweep_curve.png")
+    sweep_plot_path = output_dir / plot_name
+    plot_boundary_sweep(
+        sweep_plot_path,
+        primary_sweep=sweep,
+        primary_curves=primary_curves,
+        primary_title=primary_title,
+        compare_sweep=compare_sweep,
+        compare_curves=compare_curves,
+        compare_title=compare_title,
+        step_tol_rel=args.step_tolerance,
+    )
+    console.print(f"Saved sweep plot to {sweep_plot_path}")
+
     # Confidence cut-off: chosen on val, reported once on test
     val_conf = val_probs.max(-1)
     val_correct = (val_preds == val_labels).astype(float)
@@ -322,7 +510,7 @@ def main():
             'val_coverage': chosen['coverage'], 'test_coverage': float(mask.mean()),
             'test_accuracy_on_accepted': float(correct[mask].mean()) if mask.any() else None,
         }
-        console.print(f"\n[bold]Confidence cut-off (selected on val for 99% accuracy):[/bold] {chosen['cutoff']:.2f} → "
+        console.print(f"\n[bold]Confidence cut-off (selected on val for 99% accuracy):[/bold] {chosen['cutoff']:.2f} -> "
                       f"test coverage {abstain['test_coverage']:.1%}, accuracy on accepted {abstain['test_accuracy_on_accepted']:.3f}")
     else:
         abstain = {'target_accuracy': 0.99, 'target_met_on_val': False}
@@ -351,7 +539,7 @@ def main():
     }
     with open(output_dir / "evaluation_summary.json", 'w') as f:
         json.dump(results, f, indent=2)
-    console.print(f"\n💾 Saved {output_dir / 'evaluation_summary.json'}")
+    console.print(f"\nSaved {output_dir / 'evaluation_summary.json'}")
 
 
 if __name__ == "__main__":

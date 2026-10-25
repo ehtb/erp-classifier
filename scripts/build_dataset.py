@@ -95,13 +95,13 @@ def main():
     console.print(f"  Output: {args.output_dir}")
 
     # Load records
-    console.print(f"\n📂 Loading records from {args.input}...")
+    console.print(f"\nLoading records from {args.input}...")
     records = []
     with open(args.input) as f:
         for line in f:
             records.append(json.loads(line))
 
-    console.print(f"✓ Loaded {len(records)} records")
+    console.print(f"Loaded {len(records)} records")
 
     # Build multimodal splits
     builder = MultimodalDatasetBuilder(random_seed=args.seed)
@@ -117,7 +117,7 @@ def main():
         price_band=args.price_band,
     )
 
-    console.print(f"\n[bold green]✓ Multimodal dataset created successfully![/bold green]")
+    console.print("\n[bold green]Multimodal dataset created.[/bold green]")
     console.print(f"\n  Train: {train_path}")
     console.print(f"  Val:   {val_path}")
     console.print(f"  Test:  {test_path}")

@@ -225,7 +225,7 @@ ID2LABEL = {idx: label for label, idx in LABEL2ID.items()}
 NUM_LABELS = len(GLAccount)
 
 
-# Model configuration
+# Model configuration (defaults matched to train.py)
 MODEL_CONFIG = {
     "base_model": "distilbert-base-uncased",  # Lightweight, good for small datasets
     # Alternative options:
@@ -234,9 +234,10 @@ MODEL_CONFIG = {
     # "bert-base-uncased"            # Established baseline
     "max_length": 128,
     "batch_size": 16,
-    "learning_rate": 2e-5,
-    "num_epochs": 3,
-    "warmup_ratio": 0.1,
+    "learning_rate": 3e-5,
+    "tabular_lr": 5e-4,
+    "num_epochs": 8,
+    "warmup_ratio": 0.15,
     "weight_decay": 0.01,
 }
 
