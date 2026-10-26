@@ -27,6 +27,20 @@ On the synthetic test set, the model picks the right account for about 96 of 100
 
 Full tables, baselines and ablations are in [docs/building.md](docs/building.md#results).
 
+## Compared with traditional ML
+
+Here "traditional ML" means TF-IDF with logistic regression, optionally with the amount split into bins and the department added as extra columns (`scripts/baselines.py`). It runs on the same data and split.
+
+| | Traditional ML | Jev-like model |
+| --- | --- | --- |
+| Accuracy | 95.0% on text alone, 96.5% with amount bins and department | 96.5% |
+| The €800 cut-off | Text alone never switches. With amount bins it switches within 1.3% of €800 | Switches once, within 0.6% of €800, and scores 94.8% across the price sweep vs 92.6% |
+| Messy, multilingual text | Only matches words seen in training, so German *Bürostuhl* and English *office chair* are unrelated | A pretrained language model handles synonyms, English/German/Dutch and truncated SAP text |
+| Cost | Cheapest to train and run on a plain CPU | 66.8M parameters. Trains in about 4 minutes on an Apple Silicon laptop, predicts in milliseconds on a CPU, and has no per-call fees like a hosted LLM |
+| Confidence scores | Not measured here | Calibrated (ECE 0.046), which is what the 90% auto-post cutoff relies on |
+
+On accuracy alone the two tie, so if your text is clean and you only need the right account, the traditional model is the better deal. The Jev-like model earns its extra compute when the text is noisy or multilingual, when a sharp price cut-off matters, and when you need trustworthy confidence scores to decide what goes to a person.
+
 ## Quick start
 
 The rest of this page is hands-on setup for engineers. The repository includes the pre-generated dataset splits in `output/multimodal/`. Train a checkpoint locally (about 4 minutes on Apple Silicon; see [docs/building.md](docs/building.md)), then run the CLI or browser demo.
