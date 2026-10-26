@@ -38,7 +38,7 @@ python scripts/evaluate.py \
   --output-dir output/evaluation-multimodal
 ```
 
-Model checkpoints live under `models/` (gitignored). Once trained, both `python classify_erp.py` and `python app.py` load `models/multimodal-classifier` by default.
+Model checkpoints live under `models/` (gitignored). Once trained, both `python classify_erp.py` and `python demo/app.py` load `models/multimodal-classifier` by default.
 
 ## Generate new synthetic data
 
@@ -139,7 +139,7 @@ python scripts/build_dataset.py --input output/03_filtered.jsonl \
   --output-dir output/multimodal-band --price-band
 ```
 
-The edges are saved as `price_band.json` next to the dataset and copied into the checkpoint by `train.py`. Evaluation, the ensemble script, the baselines, `classify_erp.py`, and `app.py` read that file and recompute the token for every swept or typed amount. Checkpoints without the file behave as single-stage models. Because the edges come from the labelling rule, read Config F's sweep numbers as an upper bound when the boundary is known ahead of time.
+The edges are saved as `price_band.json` next to the dataset and copied into the checkpoint by `train.py`. Evaluation, the ensemble script, the baselines, `classify_erp.py`, and `demo/app.py` read that file and recompute the token for every swept or typed amount. Checkpoints without the file behave as single-stage models. Because the edges come from the labelling rule, read Config F's sweep numbers as an upper bound when the boundary is known ahead of time.
 
 ## Architecture details
 
@@ -234,10 +234,14 @@ src/
 ├── multimodal_dataset.py  # Grouped split, scrubbing, counterfactuals, weights
 └── llm_client.py          # Unified LLM backend (OpenAI, OpenRouter, Bedrock)
 
-Root scripts:
+Root scripts & directories:
 ├── classify_erp.py        # CLI inference and counterfactual sweep tool
-├── app.py                 # Interactive Gradio browser demo
-└── train.py               # Training script
+├── train.py               # Training script
+├── demo/
+│   └── app.py             # Interactive Gradio browser demo
+└── docs/
+    ├── architecture.md    # Non-scientific architecture guide with examples and tradeoffs
+    └── building.md        # Building, training, and evaluation guide
 
 scripts/ (pipeline tools):
 ├── generate_data.py       # End-to-end data generation pipeline

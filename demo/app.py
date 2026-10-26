@@ -4,23 +4,27 @@ Interactive browser demo for the ERP GL Account Classifier.
 
 Run locally:
     pip install -e ".[demo]"
-    python app.py
+    python demo/app.py
 """
 
 import argparse
+import sys
+from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 
-from classify_erp import DEFAULT_CONFIDENCE_CUTOFF, DEFAULT_MODEL_DIR, ERPClassifier
-from src.boundaries import price_band_edges
-from src.config import LABEL2ID
-from src.metrics import DEFAULT_STEP_TOL_REL
-from src.model import predict_probs
-from src.text import scrub_prices, sweep_texts
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from classify_erp import DEFAULT_CONFIDENCE_CUTOFF, DEFAULT_MODEL_DIR, ERPClassifier  # noqa: E402
+from src.boundaries import price_band_edges  # noqa: E402
+from src.config import LABEL2ID  # noqa: E402
+from src.metrics import DEFAULT_STEP_TOL_REL  # noqa: E402
+from src.model import predict_probs  # noqa: E402
+from src.text import scrub_prices, sweep_texts  # noqa: E402
 
 PRESET_EXAMPLES = [
     ["Amazon Services Europe", "Dell UltraSharp U2723DE 27 Monitor", "IT_OPS", 750.0],

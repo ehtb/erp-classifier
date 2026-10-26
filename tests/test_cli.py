@@ -11,8 +11,8 @@ import pytest
 import torch
 from transformers import DistilBertConfig, DistilBertTokenizer
 
-from app import evaluate_transaction
 from classify_erp import ERPClassifier, parse_sweep_spec
+from demo.app import evaluate_transaction
 from scripts.evaluate import plot_boundary_sweep
 from src.config import ID2LABEL, NUM_LABELS
 from src.model import ERPClassifierModel, get_device

@@ -1,6 +1,6 @@
 [project]
 name = "erp-classifier"
-version = "0.5.0"
+version = "0.5.1"
 description = "Synthetic data generation and fine-tuning pipeline for ERP GL account classification"
 requires-python = ">=3.10"
 dependencies = [
