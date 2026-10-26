@@ -188,7 +188,7 @@ The Dell UltraSharp monitor at €750 and €850, using [`output/multimodal/scal
 Bins 10 and 11 flip from `0` to `1` across €800, so the network only needs a positive weight on them to switch from OPEX (`GL_6220`) to CAPEX (`GL_1400`).
 
 #### Tradeoffs
-- Why not sine/cosine (`PeriodicNumericalEncoding`, [`src/model.py:23-64`](../src/model.py#L23-L64))? They repeat, so the model could flip to CAPEX at €800 and *back* to OPEX at €2,000. PLE bars only go up, so a higher price pushes the score one way. Across 33 IT test items: 100% single flip, 0% non-monotone ([`README.md:87-97`](../README.md#L87-L97)).
+- Why not sine/cosine (`PeriodicNumericalEncoding`, [`src/model.py:23-64`](../src/model.py#L23-L64))? They repeat, so the model could flip to CAPEX at €800 and *back* to OPEX at €2,000. PLE bars only go up, so a higher price pushes the score one way. Across 33 IT test items: 100% single flip, 0% non-monotone ([`building.md`](building.md#results)).
 - Why not hardcode `if amount >= 800`? The rule only applies to IT hardware, and the model doesn't know in advance which invoices those are. Learning it from data fires the switch only when text and department point to IT hardware. The cost: the learned boundary lands within ~0.6% of €800 (roughly €795–€805), not exactly on it, unless you use the optional `--price-band` mode ([`src/text.py:70-107`](../src/text.py#L70-L107)).
 
 ---
@@ -255,7 +255,7 @@ Three Dell monitor presets from [`demo/app.py:30-32`](../demo/app.py#L30-L32) (a
 2. €850.00 ([`demo/app.py:31`](../demo/app.py#L31)): `GL_1400_IT_HARDWARE_CAPEX`, 97.7% confidence $\rightarrow$ `AUTO_POST`.
 3. €800.00 ([`demo/app.py:32`](../demo/app.py#L32)) or a €0 credit note ([`demo/app.py:35`](../demo/app.py#L35)): at €800.00 the probability splits between OPEX and CAPEX (~64%–68% top-1). Since `68% < 90%`, [`classify_erp.py:222`](../classify_erp.py#L222) and [`demo/app.py:147-150`](../demo/app.py#L147-L150) send it to `MANUAL_REVIEW`.
 
-On the test set, the 90% cutoff auto-posts 94.3% of invoices (133/141) with 100% precision and sends the other 8 borderline or unusual cases to review ([`README.md:101-106`](../README.md#L101-L106)).
+On the test set, the 90% cutoff auto-posts 94.3% of invoices (133/141) with 100% precision and sends the other 8 borderline or unusual cases to review ([`building.md`](building.md#confidence-routing)).
 
 ---
 

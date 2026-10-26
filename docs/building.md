@@ -139,7 +139,34 @@ python scripts/build_dataset.py --input output/03_filtered.jsonl \
   --output-dir output/multimodal-band --price-band
 ```
 
-The edges are saved as `price_band.json` next to the dataset and copied into the checkpoint by `train.py`. Evaluation, the ensemble script, the baselines, `classify_erp.py`, and `demo/app.py` read that file and recompute the token for every swept or typed amount. Checkpoints without the file behave as single-stage models. Because the edges come from the labelling rule, read Config F's sweep numbers as an upper bound when the boundary is known ahead of time.
+The edges are saved as `price_band.json` next to the dataset and copied into the checkpoint by `train.py`. Evaluation, the ensemble script, the baselines, `classify_erp.py`, and `demo/app.py` read that file and recompute the token for every swept or typed amount. Checkpoints without the file behave as single-stage models. Because the edges come from the labelling rule, read Config F's sweep numbers as an upper bound when the boundary is known ahead of time. With the band, the OPEX-to-CAPEX switch lands exactly on 800 EUR instead of about 0.6% off, and test accuracy stays within noise (95.7% vs 96.5%). It is off by default because it hands the rule boundary to the model.
+
+## Results
+
+Numbers for the default model (v0.4.0) on the synthetic dataset. Reproduce them with the commands in [Reproducing the ablations](#reproducing-the-ablations).
+
+Results come from 3 training seeds on one fixed split: 659 original training records plus 644 counterfactual copies, 141 validation records, and 141 test records (87 product groups in the test set).
+
+- Test accuracy: 96.5% ± 0.6% (seed 42: 97.2%; macro F1 0.965; ECE 0.046)
+- Items within ±12.5% of 800 EUR: 8 of 8 correct for every seed
+- Amount sweep (33 IT test items, 70 amounts each, text held fixed): the prediction flips from OPEX to CAPEX once in 100% of cases and never flips back (0% non-monotone). It is right everywhere outside a ±2% band around the boundary, and the median first crossing lands 0.60% away from 800 EUR.
+
+| Model                              | Test Accuracy | Near-Boundary | Single Flip | Tolerance Step (±2%) | Crossing Error |
+| ---------------------------------- | ------------- | ------------- | ----------- | -------------------- | -------------- |
+| Majority class                     | 12.8%         | 4/8           | n/a         | n/a                  | n/a            |
+| Amount + department (GBDT)         | 65.2%         | 8/8           | 100%        | 100%                 | 0.6%           |
+| TF-IDF + LR (text only)            | 95.0%         | 6/8           | 0%          | 0%                   | n/a            |
+| TF-IDF + binned amount + dept (LR) | 96.5%         | 8/8           | 100%        | 100%                 | 1.3%           |
+| **Multimodal PLE + CF (default)**  | **96.5%**     | **8/8**       | **100%**    | **100%**             | **0.6%**       |
+
+The counterfactual copies help the simple binned baseline too. The neural model finds the boundary about twice as precisely (0.6% vs 1.3% error) and scores higher across the sweep (94.8% vs 92.6%), but the two tie on test accuracy. The linear baseline is much cheaper, so the neural model only earns its compute if you need smooth, monotone price behaviour and calibrated probabilities on noisy descriptions. Ablation tables: [`output/evaluation-multimodal/ablation_summary.md`](../output/evaluation-multimodal/ablation_summary.md).
+
+### Confidence routing
+
+Each prediction comes with a confidence score. Lines at or above the cutoff are posted automatically, and the rest go to a person. The cutoff is the lowest confidence threshold that reaches 99% accuracy on validation data, which gives 0.90 (seed 42):
+
+- Auto-posted (`>= 0.90`): 133 of 141 test items (94.3%), all correct (100% precision)
+- Sent to manual review (`< 0.90`): 8 of 141 (5.7%), capturing €0 credit notes and items right on the 800 EUR boundary
 
 ## Architecture details
 
@@ -176,6 +203,7 @@ loss = CrossEntropyLoss(label_smoothing=0.05, sample_weight=...)
 ```
 
 - `--class-weight-mode cf` (default): weights each original IT record and its 4 counterfactual copies by $1/5$ to preserve the source class prior; `balanced` and `none` are kept for the ablation.
+- `--num-encoding periodic` restores the older sine/cosine amount encoder; piecewise-linear encoding is the default.
 - Parameters: ~66.8M (all trainable, ~4 minutes per seed on Apple MPS).
 
 ### Data pipeline
@@ -189,6 +217,7 @@ Synthetic data generation (`scripts/generate_data.py`):
 Multimodal dataset builder (`scripts/build_dataset.py`):
 - Strips explicit prices from descriptions (`scrub_prices` in `src/text.py`).
 - Fits `StandardScaler` on `[net_amount, log1p(net_amount)]` using the training split only.
+- Adds 4 rule-derived counterfactual copies per IT record, with the amount moved near 800 EUR and the label recomputed from the rules (`src/boundaries.py`). Turn off with `--counterfactuals-per-record 0`.
 - Groups near-duplicate product titles (token Jaccard >= 0.5) and assigns whole groups to 70% train, 15% validation, and 15% test.
 
 ## Using the trained model in Python
