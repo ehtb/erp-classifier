@@ -14,37 +14,26 @@ Typical pass rate: 85-90%. Most rejections are legitimately ambiguous records.
 """
 
 import json
-from typing import List, Tuple
 
-from pydantic import BaseModel, Field
 from rich.console import Console
 from tqdm import tqdm
 
+from .boundaries import boundaries
 from .config import GLAccount
-from .llm_client import create_llm_client, BaseLLMClient
+from .llm_client import BaseLLMClient, create_llm_client
 
 console = Console()
 
-
-# GL account codes listed explicitly so the model can copy one verbatim
-GL_ACCOUNTS = [
-    "GL_6220_IT_PERIPHERALS_OPEX",
-    "GL_1400_IT_HARDWARE_CAPEX",
-    "GL_6400_OFFICE_CONSUMABLES",
-    "GL_6410_FACILITY_PANTRY",
-    "GL_6150_MARKETING_PROMO",
-    "GL_6310_WORKPLACE_SAFETY_ERGONOMICS",
-    "GL_6250_TECH_BOOKS_TRAINING",
-    "GL_6450_CLEANING_MAINTENANCE",
-]
+# Derived from the enum so adding a GL account requires no duplicate list here.
+GL_ACCOUNTS = [gl.value for gl in GLAccount]
 
 # Plain-text prompt — no JSON, just ask for one GL code on a single line.
 # Small models handle this much more reliably than structured output.
-ZERO_SHOT_PROMPT = """Classify this Amazon Business invoice line into exactly one GL account.
+ZERO_SHOT_PROMPT_TEMPLATE = """Classify this Amazon Business invoice line into exactly one GL account.
 
 Rules:
-- IT items under 800 EUR → GL_6220_IT_PERIPHERALS_OPEX
-- IT items 800 EUR or above → GL_1400_IT_HARDWARE_CAPEX
+- IT items under {threshold:g} EUR → {below}
+- IT items {threshold:g} EUR or above → {above}
 - Office supplies → GL_6400_OFFICE_CONSUMABLES
 - Coffee, snacks, drinks → GL_6410_FACILITY_PANTRY
 - Branded merchandise, promo → GL_6150_MARKETING_PROMO
@@ -55,6 +44,26 @@ Rules:
 Invoice: {invoice_line}
 
 Reply with only the GL account code, nothing else."""
+
+
+def zero_shot_prompt(invoice_line: str | None = None) -> str:
+    """Prompt with the IT threshold discovered from the accounting rules.
+
+    Pass ``invoice_line`` to fill in the record; call without it to inspect the
+    template (the ``{invoice_line}`` placeholder is left intact).
+    """
+    found = boundaries("IT_HARDWARE")
+    if not found:
+        raise ValueError("IT_HARDWARE has no amount boundary in the accounting rules")
+    boundary = found[0]
+    return ZERO_SHOT_PROMPT_TEMPLATE.format(
+        threshold=boundary.amount,
+        below=boundary.below,
+        above=boundary.above,
+        invoice_line=(
+            "{invoice_line}" if invoice_line is None else invoice_line
+        ),
+    )
 
 
 def format_erp_line(record: dict) -> str:
@@ -90,112 +99,140 @@ class Critic:
         else:
             self.llm = llm_client
 
+    @staticmethod
+    def _mark_generation_error(record: dict, reason: object | None = None) -> dict:
+        """Mark a record as rejected without asking the LLM about it."""
+        record['predicted_gl'] = "ERROR"
+        record['matches_label'] = False
+        record['critic_confidence'] = "error"
+        record['critic_reasoning'] = str(
+            reason if reason is not None else record.get("generation_error", "generation failed")
+        )
+        return record
+
+    @staticmethod
+    def _parse_predicted_gl(raw: str | None) -> str:
+        """Extract the first known GL code from a raw model response."""
+        if not raw:
+            return "UNKNOWN"
+
+        raw_upper = raw.upper()
+        # First try whole tokens, which avoids matching a longer code by accident.
+        for token in raw_upper.split():
+            token = token.strip(".,;:\n")
+            if token in GL_ACCOUNTS:
+                return token
+
+        # Fallback: substring match in case the model adds extra words.
+        for gl in GL_ACCOUNTS:
+            if gl in raw_upper:
+                return gl
+        return "UNKNOWN"
+
+    def _generate_raws(
+        self,
+        prompts: list[str],
+        *,
+        show_progress: bool = True,
+        batch_size: int = 64,
+    ) -> list[str | None]:
+        """Generate critic responses, falling back to per-row calls on batch errors."""
+        all_raws: list[str | None] = []
+        batches = range(0, len(prompts), batch_size)
+        iterator = tqdm(batches, desc="Verifying records") if show_progress else batches
+
+        for i in iterator:
+            chunk = prompts[i:i + batch_size]
+            try:
+                raws = self.llm.generate_batch(
+                    chunk, temperature=0.0, max_tokens=32, batch_size=batch_size
+                )
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Batch verification failed ({exc}); retrying row by row.[/yellow]"
+                )
+                raws = []
+                for prompt in chunk:
+                    try:
+                        raws.append(
+                            self.llm.generate(prompt, temperature=0.0, max_tokens=32)
+                        )
+                    except Exception as row_exc:
+                        console.print(f"[red]Error verifying a record: {row_exc}[/red]")
+                        raws.append(None)
+
+            if len(raws) < len(chunk):
+                raws = list(raws) + [None] * (len(chunk) - len(raws))
+            all_raws.extend(raws[: len(chunk)])
+        return all_raws
+
     def verify_one(self, record: dict) -> dict:
         """
         Verify a single record with zero-shot classification.
 
         Asks for a plain GL account code on a single line — no JSON needed.
         """
+        if record.get("generation_error"):
+            return self._mark_generation_error(record)
         try:
             invoice_line = format_erp_line(record)
-            prompt = ZERO_SHOT_PROMPT.format(invoice_line=invoice_line)
+            prompt = zero_shot_prompt(invoice_line)
 
             raw = self.llm.generate(
                 prompt=prompt,
                 temperature=0.0,
                 max_tokens=32,  # GL code is at most ~40 chars
             )
-
-            # Extract the GL code: take the first token that matches a known code
-            predicted_gl = None
-            for token in raw.upper().split():
-                token = token.strip(".,;:\n")
-                for gl in GL_ACCOUNTS:
-                    if token == gl:
-                        predicted_gl = gl
-                        break
-                if predicted_gl:
-                    break
-
-            # Fallback: substring match in case the model adds extra words
-            if predicted_gl is None:
-                raw_upper = raw.upper()
-                for gl in GL_ACCOUNTS:
-                    if gl in raw_upper:
-                        predicted_gl = gl
-                        break
-
-            if predicted_gl is None:
-                predicted_gl = "UNKNOWN"
-
-            true_gl = record['gl_account']
-            record['predicted_gl'] = predicted_gl
-            record['matches_label'] = predicted_gl == true_gl
-            record['critic_confidence'] = "high" if predicted_gl != "UNKNOWN" else "low"
-            record['critic_reasoning'] = raw.strip()
-            return record
-
-        except Exception as e:
-            console.print(f"[red]Error verifying record: {e}[/red]")
-            record['predicted_gl'] = "ERROR"
-            record['matches_label'] = False
-            record['critic_confidence'] = "error"
-            record['critic_reasoning'] = str(e)
-            return record
-
-    def verify_batch(
-        self,
-        records: List[dict],
-        show_progress: bool = True,
-        batch_size: int = 64,
-    ) -> List[dict]:
-        """
-        Verify a batch of records using batched inference when available.
-        """
-        prompts = [
-            ZERO_SHOT_PROMPT.format(invoice_line=format_erp_line(r))
-            for r in records
-        ]
-
-        if hasattr(self.llm, "generate_batch"):
-            all_raws = []
-            batches = range(0, len(prompts), batch_size)
-            iterator = tqdm(batches, desc="Verifying records") if show_progress else batches
-            for i in iterator:
-                chunk = prompts[i:i + batch_size]
-                raws = self.llm.generate_batch(chunk, temperature=0.0, max_tokens=32, batch_size=batch_size)
-                all_raws.extend(raws)
-        else:
-            iterator = tqdm(prompts, desc="Verifying records") if show_progress else prompts
-            all_raws = [self.llm.generate(p, temperature=0.0, max_tokens=32) for p in iterator]
-
-        results = []
-        for record, raw in zip(records, all_raws):
-            record = record.copy()
-            predicted_gl = None
-            raw_upper = raw.upper()
-            for token in raw_upper.split():
-                token = token.strip(".,;:\n")
-                if token in GL_ACCOUNTS:
-                    predicted_gl = token
-                    break
-            if predicted_gl is None:
-                for gl in GL_ACCOUNTS:
-                    if gl in raw_upper:
-                        predicted_gl = gl
-                        break
-            if predicted_gl is None:
-                predicted_gl = "UNKNOWN"
+            predicted_gl = self._parse_predicted_gl(raw)
 
             record['predicted_gl'] = predicted_gl
             record['matches_label'] = predicted_gl == record['gl_account']
             record['critic_confidence'] = "high" if predicted_gl != "UNKNOWN" else "low"
-            record['critic_reasoning'] = raw.strip()
+            record['critic_reasoning'] = (raw or "").strip()
+            return record
+
+        except Exception as e:
+            console.print(f"[red]Error verifying record: {e}[/red]")
+            return self._mark_generation_error(record, e)
+
+    def verify_batch(
+        self,
+        records: list[dict],
+        show_progress: bool = True,
+        batch_size: int = 64,
+    ) -> list[dict]:
+        """Verify a batch of records; failed rows are rejected without a call."""
+        valid_indices = [
+            i for i, record in enumerate(records)
+            if not record.get("generation_error")
+        ]
+        prompts = [
+            zero_shot_prompt(format_erp_line(records[i]))
+            for i in valid_indices
+        ]
+        all_raws = self._generate_raws(
+            prompts, show_progress=show_progress, batch_size=batch_size
+        )
+        raw_by_index = dict(zip(valid_indices, all_raws))
+
+        results = []
+        for idx, record in enumerate(records):
+            record = record.copy()
+            if record.get("generation_error"):
+                results.append(self._mark_generation_error(record))
+                continue
+
+            raw = raw_by_index.get(idx)
+            predicted_gl = self._parse_predicted_gl(raw)
+            record['predicted_gl'] = predicted_gl
+            record['matches_label'] = predicted_gl == record['gl_account']
+            record['critic_confidence'] = "high" if predicted_gl != "UNKNOWN" else "low"
+            record['critic_reasoning'] = (raw or "").strip()
             results.append(record)
 
         return results
 
-    def filter_verified(self, records: List[dict]) -> Tuple[List[dict], List[dict]]:
+    def filter_verified(self, records: list[dict]) -> tuple[list[dict], list[dict]]:
         """
         Filter records to keep only those where critic prediction matches seed label.
 
@@ -253,7 +290,7 @@ def main():
     # Load records
     console.print(f"📂 Loading records from {args.input}")
     records = []
-    with open(args.input, 'r') as f:
+    with open(args.input) as f:
         for line in f:
             records.append(json.loads(line))
 
@@ -276,7 +313,7 @@ def main():
     # Filter
     passed, rejected = critic.filter_verified(verified_records)
 
-    console.print(f"\n[bold]Verification Results:[/bold]")
+    console.print("\n[bold]Verification Results:[/bold]")
     console.print(f"  Passed: {len(passed)}/{len(records)} ({len(passed)/len(records)*100:.1f}%)")
     console.print(f"  Rejected: {len(rejected)}/{len(records)} ({len(rejected)/len(records)*100:.1f}%)")
 

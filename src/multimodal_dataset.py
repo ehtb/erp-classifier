@@ -15,15 +15,14 @@ training distribution, not something the model has to find from scratch.
 
 import json
 import re
-import numpy as np
-from pathlib import Path
-from typing import List, Dict, Tuple
-from dataclasses import dataclass
 from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
 
-from sklearn.preprocessing import StandardScaler
+import numpy as np
 from rich.console import Console
 from rich.table import Table
+from sklearn.preprocessing import StandardScaler
 
 from .boundaries import amount_sensitive, counterfactual_amounts, near_boundary, price_band_edges
 from .config import LABEL2ID, get_gl_account
@@ -39,7 +38,7 @@ class MultimodalFeatures:
     num_features: np.ndarray  # [net_amount, log1p(net_amount)]
     dept_id: int
     label: int
-    metadata: Dict
+    metadata: dict
     sample_weight: float = 1.0
 
 
@@ -53,8 +52,14 @@ class DepartmentVocabulary:
         self.dept2id = {"UNK": 0}  # Reserve 0 for unknown
         self.id2dept = {0: "UNK"}
 
-    def fit(self, departments: List[str]):
-        """Build vocabulary from training departments."""
+    def fit(self, departments: list[str]):
+        """Build vocabulary from training departments.
+
+        Reset first so reusing a builder (or calling fit twice) cannot leave
+        stale departments mapped to colliding ids.
+        """
+        self.dept2id = {"UNK": 0}
+        self.id2dept = {0: "UNK"}
         unique_depts = sorted(set(departments))
         for idx, dept in enumerate(unique_depts, start=1):
             self.dept2id[dept] = idx
@@ -96,7 +101,7 @@ def _tokens(record: dict) -> frozenset:
     return frozenset(t for t in _WORD_RE.findall(text.lower()) if len(t) > 1)
 
 
-def near_duplicate_groups(records: List[dict], threshold: float = 0.5, max_df: float = 0.05) -> List[int]:
+def near_duplicate_groups(records: list[dict], threshold: float = 0.5, max_df: float = 0.05) -> list[int]:
     """
     Group records whose titles have token-Jaccard >= threshold (union-find).
     Candidate pairs come from an inverted index over rare tokens, so cost stays
@@ -112,10 +117,22 @@ def near_duplicate_groups(records: List[dict], threshold: float = 0.5, max_df: f
             i = parent[i]
         return i
 
-    postings: Dict[str, List[int]] = {}
+    postings: dict[str, list[int]] = {}
     for i, t in enumerate(toks):
         for w in t:
             postings.setdefault(w, []).append(i)
+
+    # Identical token sets have Jaccard 1.0. Union them directly: this covers
+    # repeated generic titles whose tokens are all too common for the
+    # rare-token index below.
+    exact_buckets: dict[tuple, list[int]] = {}
+    for i, t in enumerate(toks):
+        exact_buckets.setdefault(tuple(sorted(t)), []).append(i)
+    for bucket in exact_buckets.values():
+        if len(bucket) > 1:
+            root = find(bucket[0])
+            for j in bucket[1:]:
+                parent[find(j)] = root
 
     limit = max(2, int(max_df * len(records)))
     for i, t in enumerate(toks):
@@ -124,7 +141,7 @@ def near_duplicate_groups(records: List[dict], threshold: float = 0.5, max_df: f
             if len(postings[w]) <= limit:
                 candidates.update(postings[w])
         for j in candidates:
-            if j > i:
+            if j > i and find(i) != find(j):
                 u = toks[j]
                 if len(t & u) / len(t | u) >= threshold:
                     parent[find(i)] = find(j)
@@ -214,31 +231,33 @@ class MultimodalDatasetBuilder:
             sample_weight=float(record.get('sample_weight', 1.0)),
         )
 
-    def fit(self, train_records: List[dict]):
+    def fit(self, train_records: list[dict]):
         """
         Fit scaler and vocabulary on training data ONLY.
         Critical: no data leakage from validation/test.
         """
         console.print("\n📊 Fitting scalers and vocabularies on training data...")
 
-        # Fit department vocabulary
+        # Fit department vocabulary (fresh, so a reused builder cannot accumulate ids)
+        self.dept_vocab = DepartmentVocabulary()
         departments = [r['department'] for r in train_records]
         self.dept_vocab.fit(departments)
 
         # Fit numerical scaler
+        self.scaler = StandardScaler()
         amounts = np.array([
             [float(r['net_amount_eur']), np.log1p(float(r['net_amount_eur']))]
             for r in train_records
         ], dtype=np.float32)
 
         self.scaler.fit(amounts)
-        console.print(f"✓ Numerical scaler fitted")
+        console.print("✓ Numerical scaler fitted")
         console.print(f"  Mean: {self.scaler.mean_}")
         console.print(f"  Std:  {self.scaler.scale_}")
 
         self.fitted = True
 
-    def transform(self, records: List[dict]) -> List[MultimodalFeatures]:
+    def transform(self, records: list[dict]) -> list[MultimodalFeatures]:
         """
         Transform records to multimodal features.
         Scaler and vocabulary must be fitted first.
@@ -261,7 +280,7 @@ class MultimodalDatasetBuilder:
 
     def build_splits(
         self,
-        records: List[dict],
+        records: list[dict],
         output_dir: Path,
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
@@ -270,7 +289,7 @@ class MultimodalDatasetBuilder:
         bin_weighting: str = "unweighted",
         n_bins: int = 16,
         price_band: bool = False,
-    ) -> Tuple[Path, Path, Path]:
+    ) -> tuple[Path, Path, Path]:
         """
         Build train/val/test splits with multimodal features.
 
@@ -395,7 +414,7 @@ class MultimodalDatasetBuilder:
 
     @staticmethod
     def _greedy_group_split(
-        records: List[dict],
+        records: list[dict],
         groups: np.ndarray,
         strata: np.ndarray,
         train_ratio: float,
@@ -424,7 +443,7 @@ class MultimodalDatasetBuilder:
             for k in ratios
         }
 
-        members: Dict[int, List[int]] = {}
+        members: dict[int, list[int]] = {}
         for i, g in enumerate(groups):
             members.setdefault(int(g), []).append(i)
 
@@ -466,7 +485,7 @@ class MultimodalDatasetBuilder:
             np.array(sorted(chosen['test']), dtype=int),
         )
 
-    def counterfactuals(self, records: List[dict], per_record: int) -> List[dict]:
+    def counterfactuals(self, records: list[dict], per_record: int) -> list[dict]:
         """
         Re-amounted copies of amount-sensitive records. The GL label comes from the
         accounting rules (`get_gl_account`), never from a hard-coded threshold, so the
@@ -510,11 +529,11 @@ class MultimodalDatasetBuilder:
 
     @staticmethod
     def fit_bin_edges(
-        train_features: List[MultimodalFeatures],
+        train_features: list[MultimodalFeatures],
         strategy: str,
         n_bins: int,
         weighting: str = "unweighted",
-    ) -> List[float]:
+    ) -> list[float]:
         """
         Bin edges over the (standardised) log-amount for piecewise-linear encoding,
         learned from training data only.
@@ -548,9 +567,9 @@ class MultimodalDatasetBuilder:
 
     def _print_distribution(
         self,
-        train_features: List[MultimodalFeatures],
-        val_features: List[MultimodalFeatures],
-        test_features: List[MultimodalFeatures]
+        train_features: list[MultimodalFeatures],
+        val_features: list[MultimodalFeatures],
+        test_features: list[MultimodalFeatures]
     ):
         """Print GL account distribution across splits."""
         table = Table(title="\nGL Account Distribution Across Splits", show_header=True)
@@ -585,7 +604,7 @@ class MultimodalDatasetBuilder:
         console.print(table)
 
 
-def load_multimodal_dataset(jsonl_path: Path) -> List[Dict]:
+def load_multimodal_dataset(jsonl_path: Path) -> list[dict]:
     """Load multimodal features from JSONL."""
     records = []
     with open(jsonl_path) as f:

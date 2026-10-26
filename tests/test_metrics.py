@@ -12,7 +12,12 @@ from src.metrics import (
     sweep_case_metrics,
 )
 from src.model import PiecewiseLinearEncoding
-from src.multimodal_dataset import MultimodalDatasetBuilder, MultimodalFeatures, near_duplicate_groups
+from src.multimodal_dataset import (
+    DepartmentVocabulary,
+    MultimodalDatasetBuilder,
+    MultimodalFeatures,
+    near_duplicate_groups,
+)
 from src.text import contains_price, scrub_prices
 
 
@@ -156,6 +161,24 @@ def test_group_split_is_deterministic_and_keeps_groups_intact():
     assert tr_g.isdisjoint(te_g)
     assert va_g.isdisjoint(te_g)
     assert len(tr1) + len(va1) + len(te1) == len(records)
+
+
+def test_near_duplicate_groups_handles_repeated_generic_titles():
+    records = [
+        {"title": "Dell monitor", "description": "Dell monitor"}
+        for _ in range(100)
+    ]
+    groups = near_duplicate_groups(records)
+    assert len(set(groups)) == 1
+
+
+def test_department_vocabulary_fit_resets_existing_ids():
+    vocab = DepartmentVocabulary()
+    vocab.fit(["IT_OPS"])
+    vocab.fit(["MARKETING"])
+
+    assert vocab.dept2id == {"UNK": 0, "MARKETING": 1}
+    assert vocab.id2dept == {0: "UNK", 1: "MARKETING"}
 
 
 def test_ece_and_risk_coverage_helpers():

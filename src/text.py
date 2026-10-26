@@ -16,8 +16,8 @@ explicit field leak, and removing it requires regenerating the text.
 import bisect
 import json
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
 
 # Currency-marked amounts in either order, plus the generator's standalone
 # two-decimal format ("799.00"). One-decimal values ("2.5 m cable") are left
@@ -52,7 +52,7 @@ def scrub_prices(text: str) -> str:
     return out.strip()
 
 
-def scrub_record(record: Dict) -> Dict:
+def scrub_record(record: dict) -> dict:
     """Return a copy with explicit price quotes removed from description/title.
 
     Sets `price_quoted` on the copy so downstream evaluation can report the
@@ -91,14 +91,14 @@ def set_price_band(text: str, amount: float, edges: Sequence[float]) -> str:
     return f"[PRICE_BAND] {price_band_index(amount, edges)} {body}"
 
 
-def sweep_texts(text: str, amounts: Sequence[float], edges: Optional[Sequence[float]]) -> List[str]:
+def sweep_texts(text: str, amounts: Sequence[float], edges: Sequence[float] | None) -> list[str]:
     """The text to score at each swept amount: the band token follows the amount, else fixed text."""
     if edges is None:
         return [text] * len(amounts)
     return [set_price_band(text, a, edges) for a in amounts]
 
 
-def load_price_band_edges(directory: Path) -> Optional[List[float]]:
+def load_price_band_edges(directory: Path) -> list[float] | None:
     """Band edges saved next to a dataset or checkpoint, or None for a single-stage model."""
     path = Path(directory) / PRICE_BAND_FILE
     if not path.exists():

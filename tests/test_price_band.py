@@ -7,7 +7,7 @@ import pytest
 
 from src import config
 from src.boundaries import boundaries, price_band_edges
-from src.config import ACCOUNTING_RULES, AccountingRule, GLAccount, PRICE_RANGES
+from src.config import ACCOUNTING_RULES, PRICE_RANGES, AccountingRule, GLAccount
 from src.multimodal_dataset import MultimodalDatasetBuilder
 from src.text import (
     PRICE_BAND_FILE,

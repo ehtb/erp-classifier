@@ -16,19 +16,19 @@ After data generation:
 
 import argparse
 import json
-from pathlib import Path
-import sys
 import os
+import sys
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
 
-from src.seed_generator import SeedGenerator, print_distribution_summary
-from src.verbalizer import Verbalizer
+from src.config import DATA_GEN_CONFIG
 from src.corruptor import ERPCorruptor
 from src.critic import Critic
 from src.dataset_builder import DatasetBuilder
-from src.config import DATA_GEN_CONFIG
+from src.seed_generator import SeedGenerator, print_distribution_summary
+from src.verbalizer import Verbalizer
 
 console = Console()
 
@@ -63,7 +63,6 @@ def run_pipeline(
     filtered_data_path = output_dir / "03_filtered.jsonl"
     rejected_data_path = output_dir / "03_rejected.jsonl"
     splits_dir = output_dir / "splits"
-    model_dir = output_dir / "model"
 
     console.print(Panel.fit(
         "[bold cyan]ERP GL Account Classifier Pipeline[/bold cyan]\n\n"
@@ -175,6 +174,11 @@ def run_pipeline(
 
     splits_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = builder.build_splits(passed, splits_dir)
+    console.print(
+        "[yellow]Legacy HF splits saved to "
+        f"{dataset_path}; train.py uses the multimodal JSONL from "
+        "scripts/build_dataset.py instead.[/yellow]"
+    )
 
     # Build counterfactual test set
     cf_pairs_tuples = [(cf_records[i], cf_records[i+1]) for i in range(0, len(cf_records), 2)]

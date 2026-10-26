@@ -9,8 +9,8 @@ boundary-aware splits, counterfactual augmentation and sweep tests follow.
 """
 
 import math
-from functools import lru_cache
-from typing import List, NamedTuple, Optional, Tuple
+from functools import cache
+from typing import NamedTuple
 
 import numpy as np
 
@@ -27,8 +27,8 @@ def _gl(category: str, amount: float) -> str:
     return get_gl_account(category, amount).value
 
 
-@lru_cache(maxsize=None)
-def boundaries(category: Optional[str]) -> List[Boundary]:
+@cache
+def boundaries(category: str | None) -> list[Boundary]:
     """Amounts at which the GL account for `category` changes (empty if amount-insensitive)."""
     if category is None or category not in PRICE_RANGES:
         return []
@@ -50,8 +50,8 @@ def boundaries(category: Optional[str]) -> List[Boundary]:
     return found
 
 
-@lru_cache(maxsize=None)
-def price_band_edges() -> Tuple[float, ...]:
+@cache
+def price_band_edges() -> tuple[float, ...]:
     """
     Every distinct decision boundary across all categories, ascending.
 
@@ -75,16 +75,16 @@ def price_band_edges() -> Tuple[float, ...]:
     return tuple(sorted(found))
 
 
-def amount_sensitive(category: Optional[str]) -> bool:
+def amount_sensitive(category: str | None) -> bool:
     return bool(boundaries(category))
 
 
-def near_boundary(category: Optional[str], amount: float, rel: float = 0.125) -> bool:
+def near_boundary(category: str | None, amount: float, rel: float = 0.125) -> bool:
     """True when `amount` lies within +/- rel (relative) of any decision boundary."""
     return any(abs(amount - b.amount) <= rel * b.amount for b in boundaries(category))
 
 
-def counterfactual_amounts(category: str, n: int, rng: np.random.Generator, rel: float = 0.3) -> List[float]:
+def counterfactual_amounts(category: str, n: int, rng: np.random.Generator, rel: float = 0.3) -> list[float]:
     """
     Amounts log-uniformly spread within +/- rel of the category's boundaries,
     alternating below/above so both sides are equally represented.

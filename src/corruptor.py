@@ -7,9 +7,8 @@ Applies deterministic corruption patterns seen in real ERP systems:
 3. OCR character substitutions (O->0, I->1, etc.)
 """
 
-import random
-from typing import List
 import json
+import random
 
 from rich.console import Console
 
@@ -126,7 +125,7 @@ class ERPCorruptor:
 
         return record
 
-    def corrupt_batch(self, records: List[dict]) -> List[dict]:
+    def corrupt_batch(self, records: list[dict]) -> list[dict]:
         """Apply corruption to a batch of records."""
         corrupted = []
         for record in records:
@@ -175,7 +174,7 @@ def main():
     # Load records
     console.print(f"📂 Loading records from {args.input}")
     records = []
-    with open(args.input, 'r') as f:
+    with open(args.input) as f:
         for line in f:
             records.append(json.loads(line))
 

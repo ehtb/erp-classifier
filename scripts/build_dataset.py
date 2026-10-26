@@ -14,8 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.multimodal_dataset import MultimodalDatasetBuilder
 from rich.console import Console
+
+from src.multimodal_dataset import MultimodalDatasetBuilder
 
 console = Console()
 
@@ -90,7 +91,7 @@ def main():
 
     args = parser.parse_args()
 
-    console.print(f"\n[bold]Building Multimodal Dataset[/bold]")
+    console.print("\n[bold]Building Multimodal Dataset[/bold]")
     console.print(f"  Input: {args.input}")
     console.print(f"  Output: {args.output_dir}")
 

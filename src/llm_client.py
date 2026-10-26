@@ -4,7 +4,6 @@ Unified LLM client supporting multiple backends.
 
 import json
 import os
-from typing import Optional, Dict, Any, List
 from abc import ABC, abstractmethod
 from enum import Enum
 
@@ -74,7 +73,7 @@ class BaseLLMClient(ABC):
     def generate(
         self,
         prompt: str,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
     ) -> str:
@@ -86,12 +85,36 @@ class BaseLLMClient(ABC):
         self,
         prompt: str,
         response_model: type[BaseModel],
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
     ) -> BaseModel:
         """Generate structured output matching Pydantic model."""
         pass
+
+    def generate_batch(
+        self,
+        prompts: list[str],
+        system_prompt: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 512,
+        batch_size: int = 32,
+    ) -> list[str]:
+        """Generate text completions for several prompts.
+
+        The default implementation is sequential. Backends with a native batch
+        API can override it; callers still need to handle individual failures.
+        """
+        del batch_size  # accepted for API compatibility with native batch clients
+        return [
+            self.generate(
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            for prompt in prompts
+        ]
 
 
 class OpenAICompatibleLLMClient(BaseLLMClient):
@@ -107,8 +130,8 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
     def __init__(
         self,
         model: str,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
         supports_json_mode: bool = True,
     ):
         """
@@ -128,8 +151,9 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
         self.model = model
         self.supports_json_mode = supports_json_mode
 
-        # Initialize client
-        client_kwargs = {"api_key": api_key}
+        # Initialize client. The SDK retries transient 429/5xx responses; keep the
+        # timeout finite so a stalled request cannot hang a data-generation run.
+        client_kwargs = {"api_key": api_key, "timeout": 60.0, "max_retries": 3}
         if base_url:
             client_kwargs["base_url"] = base_url
 
@@ -138,7 +162,7 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
     def generate(
         self,
         prompt: str,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
     ) -> str:
@@ -155,13 +179,16 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
             max_tokens=max_tokens,
         )
 
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+        if content is None:
+            raise RuntimeError(f"Empty completion from {self.model}")
+        return content.strip()
 
     def generate_structured(
         self,
         prompt: str,
         response_model: type[BaseModel],
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
     ) -> BaseModel:
@@ -186,7 +213,10 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
             kwargs["response_format"] = {"type": "json_object"}
 
         response = self.client.chat.completions.create(**kwargs)
-        response_text = response.choices[0].message.content.strip()
+        response_text = response.choices[0].message.content
+        if response_text is None:
+            raise RuntimeError(f"Empty completion from {self.model}")
+        response_text = response_text.strip()
 
         # Parse JSON
         if self.supports_json_mode:
@@ -212,11 +242,20 @@ class BedrockLLMClient(BaseLLMClient):
         """
         try:
             import boto3
+            from botocore.config import Config as BotocoreConfig
         except ImportError:
             raise ImportError("boto3 required for Bedrock. Install: pip install boto3")
 
         self.model_id = model_id
-        self.client = boto3.client("bedrock-runtime", region_name=region)
+        self.client = boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=BotocoreConfig(
+                retries={"max_attempts": 5, "mode": "standard"},
+                connect_timeout=10,
+                read_timeout=120,
+            ),
+        )
 
     def _is_mistral(self) -> bool:
         return "mistral" in self.model_id.lower()
@@ -227,7 +266,7 @@ class BedrockLLMClient(BaseLLMClient):
     def _is_claude(self) -> bool:
         return "claude" in self.model_id.lower()
 
-    def _format_prompt(self, prompt: str, system_prompt: Optional[str]) -> str:
+    def _format_prompt(self, prompt: str, system_prompt: str | None) -> str:
         """Format prompt for the specific model family."""
         if self._is_mistral():
             # Mistral instruct format
@@ -247,49 +286,88 @@ class BedrockLLMClient(BaseLLMClient):
                 f"{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
             )
 
+    @staticmethod
+    def _nova_request_body(
+        prompt: str,
+        system_prompt: str | None,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict:
+        """Request body for Amazon Nova on Bedrock."""
+        body = {
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "inferenceConfig": {
+                "temperature": temperature,
+                "maxTokens": max_tokens,
+            },
+        }
+        if system_prompt:
+            body["system"] = [{"text": system_prompt}]
+        return body
+
+    @staticmethod
+    def _claude_request_body(
+        prompt: str,
+        system_prompt: str | None,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict:
+        """Request body for Anthropic Claude on Bedrock's InvokeModel API."""
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system_prompt:
+            body["system"] = system_prompt
+        return body
+
+    @staticmethod
+    def _nova_response_text(response_body: dict) -> str:
+        """Extract text from a Nova InvokeModel response."""
+        content = (response_body.get("output") or {}).get("message", {}).get("content") or []
+        for block in content:
+            if isinstance(block, dict) and block.get("text"):
+                return str(block["text"]).strip()
+        return ""
+
+    @staticmethod
+    def _claude_response_text(response_body: dict) -> str:
+        """Extract text from an Anthropic Claude InvokeModel response."""
+        content = response_body.get("content") or []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type", "text") == "text" and block.get("text"):
+                return str(block["text"]).strip()
+        return ""
+
     def generate(
         self,
         prompt: str,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
     ) -> str:
         """Generate with Bedrock."""
-        # Nova and Claude use Messages API format
-        if self._is_nova() or self._is_claude():
-            # Content must be an array of content blocks
-            messages = [{
-                "role": "user",
-                "content": [{"text": prompt}]
-            }]
-
-            # Build request body for Messages API
-            body_dict = {
-                "messages": messages,
-                "inferenceConfig": {
-                    "temperature": temperature,
-                    "maxTokens": max_tokens,
-                }
-            }
-
-            # Add system prompt if provided
-            if system_prompt:
-                body_dict["system"] = [{"text": system_prompt}]
-
-            body = json.dumps(body_dict)
-
-            response = self.client.invoke_model(
-                modelId=self.model_id,
-                body=body,
+        if self._is_claude():
+            body = json.dumps(
+                self._claude_request_body(
+                    prompt, system_prompt, temperature, max_tokens
+                )
             )
-
+            response = self.client.invoke_model(modelId=self.model_id, body=body)
             response_body = json.loads(response["body"].read())
-            # Nova/Claude return output.message.content[0].text
-            if "output" in response_body and "message" in response_body["output"]:
-                content = response_body["output"]["message"]["content"]
-                if content and len(content) > 0 and "text" in content[0]:
-                    return content[0]["text"].strip()
-            return ""
+            return self._claude_response_text(response_body)
+
+        if self._is_nova():
+            body = json.dumps(
+                self._nova_request_body(prompt, system_prompt, temperature, max_tokens)
+            )
+            response = self.client.invoke_model(modelId=self.model_id, body=body)
+            response_body = json.loads(response["body"].read())
+            return self._nova_response_text(response_body)
 
         # Llama and Mistral use text completion format
         formatted_prompt = self._format_prompt(prompt, system_prompt)
@@ -318,7 +396,7 @@ class BedrockLLMClient(BaseLLMClient):
         self,
         prompt: str,
         response_model: type[BaseModel],
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
     ) -> BaseModel:
@@ -334,7 +412,7 @@ class BedrockLLMClient(BaseLLMClient):
 
 
 def create_llm_client(
-    backend: Optional[str] = None,
+    backend: str | None = None,
     **kwargs
 ) -> BaseLLMClient:
     """

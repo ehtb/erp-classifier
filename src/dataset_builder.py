@@ -1,5 +1,11 @@
 """
-Dataset builder for creating stratified train/val/test splits.
+Legacy HuggingFace dataset builder for creating stratified splits.
+
+Deprecated: the current pipeline uses ``src.multimodal_dataset`` and
+``scripts/build_dataset.py``. This module is retained for the historical
+``scripts/generate_data.py`` output and must not be used to train the
+multimodal classifier (its text format is intentionally vendor + description
+only, but it predates the grouped split and counterfactual weighting).
 
 Creates:
 1. Stratified train/val/test splits (70/15/15 default)
@@ -9,29 +15,30 @@ Creates:
 
 import json
 import random
-from pathlib import Path
-from typing import List, Dict, Tuple
 from collections import Counter
+from pathlib import Path
 
+import sklearn.model_selection as model_selection
+from datasets import ClassLabel, Dataset, DatasetDict, Features, Sequence, Value
 from rich.console import Console
 from rich.table import Table
-import sklearn.model_selection as model_selection
-from datasets import Dataset, DatasetDict, Features, Value, ClassLabel, Sequence
 
 from .config import DATA_GEN_CONFIG, GLAccount
+from .text import scrub_prices
 
 console = Console()
 
 
 def format_for_training(record: dict) -> dict:
-    """Format record for training (extract text and label)."""
-    # Format as ERP invoice line
+    """Format a legacy HF record.
+
+    Deprecated: the classifier uses ``src.multimodal_dataset`` instead. This
+    text intentionally matches the multimodal text format (vendor + scrubbed
+    description) so the amount and department are not leaked into the text.
+    """
     text = (
         f"[VENDOR] {record['vendor']} "
-        f"[DEPT] {record['department']} "
-        f"[NET_AMT] {record['net_amount_eur']:.2f} "
-        f"[CURR] EUR "
-        f"[DESC] {record['description']}"
+        f"[DESC] {scrub_prices(record['description'])}"
     )
 
     # Extract string value from gl_account (handles both string and enum)
@@ -42,7 +49,11 @@ def format_for_training(record: dict) -> dict:
         "text": text,
         "label": label,
         "metadata": {
-            "seed_id": int(record.get('seed_id') or -1),  # int64 rejects None
+            "seed_id": (
+                int(record['seed_id'])
+                if record.get('seed_id') is not None
+                else -1
+            ),  # int64 rejects None; keep seed 0 distinct
             "base_category": record.get('base_category', ''),
             "department": record.get('department', ''),
             "net_amount_eur": float(record.get('net_amount_eur') or 0.0),
@@ -96,8 +107,8 @@ class DatasetBuilder:
 
     def stratified_split(
         self,
-        records: List[dict]
-    ) -> Tuple[List[dict], List[dict], List[dict]]:
+        records: list[dict]
+    ) -> tuple[list[dict], list[dict], list[dict]]:
         """
         Create stratified train/val/test split.
 
@@ -167,7 +178,7 @@ class DatasetBuilder:
 
     def build_splits(
         self,
-        records: List[dict],
+        records: list[dict],
         output_dir: Path,
     ) -> Path:
         """
@@ -186,7 +197,7 @@ class DatasetBuilder:
         # Create stratified splits
         train, val, test = self.stratified_split(records)
 
-        console.print(f"\n[bold]Split Statistics:[/bold]")
+        console.print("\n[bold]Split Statistics:[/bold]")
         console.print(f"  Train: {len(train)} ({len(train)/len(records)*100:.1f}%)")
         console.print(f"  Val:   {len(val)} ({len(val)/len(records)*100:.1f}%)")
         console.print(f"  Test:  {len(test)} ({len(test)/len(records)*100:.1f}%)")
@@ -214,9 +225,9 @@ class DatasetBuilder:
 
     def _print_split_balance(
         self,
-        train: List[dict],
-        val: List[dict],
-        test: List[dict]
+        train: list[dict],
+        val: list[dict],
+        test: list[dict]
     ) -> None:
         """Print GL account balance across splits."""
         table = Table(title="\nGL Account Distribution Across Splits", show_header=True)
@@ -241,7 +252,7 @@ class DatasetBuilder:
 
         console.print(table)
 
-    def _build_hf_dataset(self, splits: Dict[str, List[dict]]) -> DatasetDict:
+    def _build_hf_dataset(self, splits: dict[str, list[dict]]) -> DatasetDict:
         """
         Build HuggingFace DatasetDict from split data.
 
@@ -278,7 +289,7 @@ class DatasetBuilder:
 
     def build_counterfactual_test(
         self,
-        counterfactual_pairs: List[Tuple[dict, dict]],
+        counterfactual_pairs: list[tuple[dict, dict]],
         output_dir: Path,
     ) -> Path:
         """
@@ -319,7 +330,7 @@ class DatasetBuilder:
 
     def _save_counterfactuals_hf(
         self,
-        test_records: List[dict],
+        test_records: list[dict],
         output_dir: Path,
     ) -> Path:
         """Save counterfactual test set as HuggingFace Dataset."""
@@ -407,7 +418,7 @@ def main():
     # Load records
     console.print(f"📂 Loading records from {args.input}")
     records = []
-    with open(args.input, 'r') as f:
+    with open(args.input) as f:
         for line in f:
             records.append(json.loads(line))
 
@@ -426,19 +437,22 @@ def main():
     # Build counterfactual test set if provided
     if args.counterfactuals:
         console.print(f"\n📂 Loading counterfactual pairs from {args.counterfactuals}")
-        with open(args.counterfactuals, 'r') as f:
+        with open(args.counterfactuals) as f:
             data = json.load(f)
 
-        # Convert pairs back to tuples
+        # Convert pairs back to tuples (kept for the legacy pipeline warning)
         pairs = [(p['low'], p['high']) for p in data['counterfactual_pairs']]
 
         # Note: Pairs need to be verbalized first
-        console.print(f"[yellow]⚠ Counterfactual pairs need to be verbalized before building test set[/yellow]")
+        console.print(
+            f"[yellow]⚠ {len(pairs)} counterfactual pairs need to be verbalized "
+            "before building the legacy test set[/yellow]"
+        )
         console.print(f"   Use: python -m src.verbalizer --input {args.counterfactuals} --output <verbalized.jsonl>")
 
     console.print(f"\n[bold green]✓ HuggingFace dataset created: {dataset_path}[/bold green]")
-    console.print(f"\nLoad with:")
-    console.print(f"  from datasets import load_from_disk")
+    console.print("\nLoad with:")
+    console.print("  from datasets import load_from_disk")
     console.print(f"  dataset = load_from_disk('{dataset_path}')")
 
 

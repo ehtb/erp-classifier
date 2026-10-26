@@ -204,7 +204,7 @@ def _panel_title_for_model(model_dir: Path, model, override: str = None) -> str:
         return override
     parts = set(model_dir.parts)
     if "D_ple_quantile_cf" in parts or model_dir.name == "multimodal-classifier":
-        return "v0.4.0 Default (Piecewise-Linear + Counterfactuals)"
+        return "Default (Piecewise-Linear + Counterfactuals)"
     if "A_periodic_nocf" in parts:
         return "v0.3.0 Baseline (Periodic Encoding, No Counterfactuals)"
     enc = getattr(model, "num_encoding", "ple")
@@ -356,8 +356,8 @@ def main():
                         help="Relative band around the boundary excluded from tolerance-step accuracy")
     parser.add_argument("--skip-text-ablations", action="store_true",
                         help="Skip the price-stripped and constant-text diagnostic passes")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Training seed, recorded in the summary")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Training seed, recorded in the summary (default: 42)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)

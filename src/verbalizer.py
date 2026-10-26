@@ -7,28 +7,45 @@ the category and price. This prevents it from writing "IT peripheral" or "capita
 equipment" in the description, which would leak the answer the classifier is supposed
 to learn.
 
-The prompts include price hints (< 800 EUR vs >= 800 EUR for IT hardware) because
-that's information a person writing a product listing would have, but they never
-mention the accounting classification.
+The prompts include price hints (below vs at/above the IT hardware rule threshold)
+because that's information a person writing a product listing would have, but they
+never mention the accounting classification. The threshold is discovered from
+``src/boundaries.py``, not hard-coded here.
 """
 
+import hashlib
 import json
-from typing import List
+import re
 from dataclasses import asdict
 
-from pydantic import BaseModel, Field
 from rich.console import Console
 from tqdm import tqdm
 
+from .boundaries import boundaries
+from .config import TextStyle
+from .llm_client import BaseLLMClient, create_llm_client
 from .seed_generator import SeedSpec
-from .config import Language, TextStyle
-from .llm_client import create_llm_client, BaseLLMClient
 
 console = Console()
 
+SYSTEM_PROMPT = (
+    "You write realistic Amazon product listings. "
+    "Output exactly two lines: line 1 is the product title, line 2 is a one-sentence description. "
+    "Never mention accounting codes, GL accounts, or expense categories."
+)
 
-import hashlib
-import string
+_PREFIX_RE = re.compile(
+    r"^\s*(?:title|description|line\s*\d+)\s*[:.\-]\s*", re.IGNORECASE
+)
+
+
+def _it_threshold() -> float:
+    """IT hardware cutoff, discovered from the accounting rules."""
+    found = boundaries("IT_HARDWARE")
+    if not found:
+        raise ValueError("IT_HARDWARE has no amount boundary in the accounting rules")
+    return found[0].amount
+
 
 def _fake_asin(seed_id: int) -> str:
     """Generate a deterministic plausible ASIN from a seed id."""
@@ -87,9 +104,13 @@ class Verbalizer:
         style_label = STYLE_LABELS.get(seed.text_style, "")
         template = CATEGORY_PROMPTS.get(seed.base_category, CATEGORY_PROMPTS["OFFICE_CONSUMABLES"])
 
-        # IT_HARDWARE has two sub-templates based on price threshold
+        # IT_HARDWARE has two sub-templates based on the rule threshold
         if isinstance(template, dict):
-            template = template["high"] if seed.net_amount_eur >= 800 else template["low"]
+            template = (
+                template["high"]
+                if seed.net_amount_eur >= _it_threshold()
+                else template["low"]
+            )
 
         return template.format(
             price=seed.net_amount_eur,
@@ -104,13 +125,13 @@ class Verbalizer:
 
         Falls back gracefully: if the model only outputs one line we use it
         for both fields. If it outputs nothing we return placeholder strings.
+        Prefixes such as ``Title:`` and ``Line 1:`` are stripped, not dropped.
         """
-        # Strip any preamble like "Title:" or "Line 1:"
-        lines = [
-            l.strip()
-            for l in text.strip().splitlines()
-            if l.strip() and not l.strip().lower().startswith(("title:", "description:", "line "))
-        ]
+        lines = []
+        for raw_line in (text or "").splitlines():
+            line = _PREFIX_RE.sub("", raw_line).strip()
+            if line:
+                lines.append(line)
 
         if len(lines) >= 2:
             return lines[0], lines[1]
@@ -119,24 +140,81 @@ class Verbalizer:
         else:
             return f"Amazon product {seed_id}", "Amazon Business item"
 
+    @staticmethod
+    def _fallback_result(seed: SeedSpec, error: object | None = None) -> dict:
+        """Placeholder used when generation fails; records the error for filtering."""
+        result = asdict(seed)
+        result.update(
+            {
+                "title": "Amazon product",
+                "description": "Amazon Business item",
+                "asin": _fake_asin(seed.seed_id),
+            }
+        )
+        if error is not None:
+            result["generation_error"] = str(error)
+        return result
+
+    def _generate_raws(
+        self,
+        prompts: list[str],
+        *,
+        show_progress: bool = True,
+        batch_size: int = 32,
+    ) -> list[str | None]:
+        """Generate raw text for prompts, falling back to per-row calls on batch errors."""
+        all_raws: list[str | None] = []
+        batches = range(0, len(prompts), batch_size)
+        iterator = tqdm(batches, desc="Verbalizing seeds") if show_progress else batches
+
+        for i in iterator:
+            chunk = prompts[i:i + batch_size]
+            try:
+                raw_texts = self.llm.generate_batch(
+                    chunk,
+                    system_prompt=SYSTEM_PROMPT,
+                    temperature=0.8,
+                    max_tokens=128,
+                    batch_size=batch_size,
+                )
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Batch generation failed ({exc}); retrying row by row.[/yellow]"
+                )
+                raw_texts = []
+                for prompt in chunk:
+                    try:
+                        raw_texts.append(
+                            self.llm.generate(
+                                prompt,
+                                system_prompt=SYSTEM_PROMPT,
+                                temperature=0.8,
+                                max_tokens=128,
+                            )
+                        )
+                    except Exception as row_exc:
+                        console.print(f"[red]Error verbalizing a seed: {row_exc}[/red]")
+                        raw_texts.append(None)
+
+            if len(raw_texts) < len(chunk):
+                raw_texts = list(raw_texts) + [None] * (len(chunk) - len(raw_texts))
+            all_raws.extend(raw_texts[: len(chunk)])
+        return all_raws
+
     def verbalize_one(self, seed: SeedSpec) -> dict:
         """Generate Amazon item description for a single seed."""
         try:
             prompt = self._build_prompt(seed)
 
-            system_prompt = (
-                "You write realistic Amazon product listings. "
-                "Output exactly two lines: line 1 is the product title, line 2 is a one-sentence description. "
-                "Never mention accounting codes, GL accounts, or expense categories."
-            )
-
             # Plain text generation — no JSON parsing needed
             raw = self.llm.generate(
                 prompt=prompt,
-                system_prompt=system_prompt,
+                system_prompt=SYSTEM_PROMPT,
                 temperature=0.8,
                 max_tokens=128,
             )
+            if not raw or not raw.strip():
+                raise ValueError("empty response from LLM")
 
             title, description = self._parse_plain_text(raw, seed.seed_id)
             asin = _fake_asin(seed.seed_id)
@@ -147,64 +225,64 @@ class Verbalizer:
 
         except Exception as e:
             console.print(f"[red]Error verbalizing seed {seed.seed_id}: {e}[/red]")
-            result = asdict(seed)
-            result.update({"title": "Amazon product", "description": "Amazon Business item", "asin": _fake_asin(seed.seed_id)})
-            return result
+            return self._fallback_result(seed, e)
 
     def verbalize_batch(
         self,
-        seeds: List[SeedSpec],
+        seeds: list[SeedSpec],
         show_progress: bool = True,
         batch_size: int = 32,
-    ) -> List[dict]:
+    ) -> list[dict]:
         """
         Generate descriptions for a batch of seeds.
 
-        Uses batched inference when the backend supports it,
-        falling back to sequential generation for others.
+        A failed prompt or API call produces a placeholder result with a
+        ``generation_error`` field instead of aborting the whole run. The
+        critic can then reject those rows.
         """
-        # Build all prompts up front
-        prompts = [self._build_prompt(seed) for seed in seeds]
-        system_prompt = (
-            "You write realistic Amazon product listings. "
-            "Output exactly two lines: line 1 is the product title, line 2 is a one-sentence description. "
-            "Never mention accounting codes, GL accounts, or expense categories."
+        prompts: list[str | None] = []
+        prompt_errors = {}
+        for idx, seed in enumerate(seeds):
+            try:
+                prompts.append(self._build_prompt(seed))
+            except Exception as exc:
+                prompts.append(None)
+                prompt_errors[idx] = exc
+
+        valid_indices = [i for i, prompt in enumerate(prompts) if prompt is not None]
+        valid_prompts = [prompts[i] for i in valid_indices]
+        raw_by_index = dict(
+            zip(
+                valid_indices,
+                self._generate_raws(
+                    valid_prompts,
+                    show_progress=show_progress,
+                    batch_size=batch_size,
+                ),
+            )
         )
 
-        # Backends with native batch support
-        if hasattr(self.llm, "generate_batch"):
-            all_raws = []
-            batches = range(0, len(prompts), batch_size)
-            iterator = tqdm(batches, desc="Verbalizing seeds") if show_progress else batches
-            for i in iterator:
-                chunk_prompts = prompts[i:i + batch_size]
-                raw_texts = self.llm.generate_batch(
-                    chunk_prompts,
-                    system_prompt=system_prompt,
-                    temperature=0.8,
-                    max_tokens=128,
-                    batch_size=batch_size,
-                )
-                all_raws.extend(raw_texts)
-        else:
-            # Sequential generation
-            iterator = tqdm(prompts, desc="Verbalizing seeds") if show_progress else prompts
-            all_raws = [
-                self.llm.generate(p, system_prompt=system_prompt, temperature=0.8, max_tokens=128)
-                for p in iterator
-            ]
-
-        # Parse results
         results = []
-        for seed, raw in zip(seeds, all_raws):
+        for idx, seed in enumerate(seeds):
+            if idx in prompt_errors:
+                results.append(self._fallback_result(seed, prompt_errors[idx]))
+                continue
+            raw = raw_by_index.get(idx)
+            if not raw or not raw.strip():
+                results.append(self._fallback_result(seed, "generation failed or empty response"))
+                continue
             try:
                 title, description = self._parse_plain_text(raw, seed.seed_id)
-                asin = _fake_asin(seed.seed_id)
                 result = asdict(seed)
-                result.update({"title": title, "description": description, "asin": asin})
-            except Exception:
-                result = asdict(seed)
-                result.update({"title": "Amazon product", "description": "Amazon Business item", "asin": _fake_asin(seed.seed_id)})
+                result.update(
+                    {
+                        "title": title,
+                        "description": description,
+                        "asin": _fake_asin(seed.seed_id),
+                    }
+                )
+            except Exception as exc:
+                result = self._fallback_result(seed, exc)
             results.append(result)
 
         return results
@@ -266,12 +344,12 @@ def main():
     # Load or generate seeds
     if args.input:
         console.print(f"📂 Loading seeds from {args.input}")
-        with open(args.input, 'r') as f:
+        with open(args.input) as f:
             data = json.load(f)
-        seeds = [SeedSpec(**s) for s in data['seeds']]
+        seeds = [SeedSpec.from_dict(s) for s in data['seeds']]
     elif args.num_samples:
-        from .seed_generator import SeedGenerator
         from .config import DATA_GEN_CONFIG
+        from .seed_generator import SeedGenerator
 
         console.print(f"🌱 Generating {args.num_samples} seeds")
         generator = SeedGenerator(seed=DATA_GEN_CONFIG["random_seed"])

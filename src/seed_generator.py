@@ -6,35 +6,50 @@ Generates structured seed specifications across:
 - Departments
 - Languages
 - Text styles
-- Price ranges (with oversampling around IT hardware 800 EUR threshold)
+- Price ranges (with oversampling around the IT hardware rule threshold)
 - Base categories
 
 Seeds serve as input to the LLM verbalizer which generates realistic descriptions.
 """
 
 import random
-from dataclasses import dataclass
-from typing import List
-import numpy as np
 from collections import Counter
+from dataclasses import dataclass
 
+import numpy as np
+
+from .boundaries import boundaries
 from .config import (
-    GLAccount,
+    CATEGORY_DEPT_AFFINITY,
+    DATA_GEN_CONFIG,
+    PRICE_RANGES,
+    VENDOR_VARIANTS,
     Department,
+    GLAccount,
     Language,
     TextStyle,
-    VENDOR_VARIANTS,
-    CATEGORY_DEPT_AFFINITY,
-    PRICE_RANGES,
     get_gl_account,
     get_price_distribution_weights,
-    DATA_GEN_CONFIG,
 )
+
+
+def _it_threshold() -> float:
+    """IT hardware cutoff, discovered from the accounting rules."""
+    found = boundaries("IT_HARDWARE")
+    if not found:
+        raise ValueError("IT_HARDWARE has no amount boundary in the accounting rules")
+    return found[0].amount
 
 
 @dataclass
 class SeedSpec:
-    """Structured specification for a single training example."""
+    """Structured specification for a single training example.
+
+    Values loaded from JSON are plain strings, so enum fields are coerced in
+    ``__post_init__``. This keeps ``SeedSpec(**json_dict)`` working for the
+    verbalizer CLI and avoids accidental ``'str' object has no attribute
+    'value'`` failures.
+    """
 
     seed_id: int
     base_category: str
@@ -44,6 +59,23 @@ class SeedSpec:
     text_style: TextStyle
     net_amount_eur: float
     gl_account: GLAccount
+
+    def __post_init__(self):
+        if not isinstance(self.department, Department):
+            self.department = Department(self.department)
+        if not isinstance(self.language, Language):
+            self.language = Language(self.language)
+        if not isinstance(self.text_style, TextStyle):
+            self.text_style = TextStyle(self.text_style)
+        if not isinstance(self.gl_account, GLAccount):
+            self.gl_account = GLAccount(self.gl_account)
+        self.seed_id = int(self.seed_id)
+        self.net_amount_eur = float(self.net_amount_eur)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SeedSpec":
+        """Build a spec from JSON-friendly values."""
+        return cls(**data)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
@@ -71,8 +103,9 @@ class SeedGenerator:
         """
         Sample price with strategic oversampling.
 
-        For IT_HARDWARE: sample more often between 650-950 EUR so we get enough training
-        examples near the 800 EUR threshold. Without this, random sampling would give us
+        For IT_HARDWARE: sample more often in a band around the rule threshold
+        (650-950 EUR for the current 800 EUR rule) so we get enough training
+        examples near the boundary. Without this, random sampling would give us
         too few boundary cases to verify the model learned the rule.
 
         For other categories: sample uniformly across the price range.
@@ -80,10 +113,12 @@ class SeedGenerator:
         min_price, max_price = PRICE_RANGES[category]
 
         if category == "IT_HARDWARE":
-            # Divide the price range into bins and weight each bin. The bins near 800 EUR
-            # get 5x weight, so we sample from them more often.
+            # Divide the price range into bins and weight each bin. The bins around
+            # the rule boundary get 5x weight, so we sample from them more often.
             num_bins = 20
-            weights = get_price_distribution_weights(category, num_bins)
+            weights = get_price_distribution_weights(
+                category, num_bins, threshold=_it_threshold()
+            )
             weights_array = np.array(weights, dtype=float)
             weights_array /= weights_array.sum()
 
@@ -112,7 +147,7 @@ class SeedGenerator:
 
         return self.rng.choice(eligible_depts)
 
-    def generate_seeds(self, num_samples: int) -> List[SeedSpec]:
+    def generate_seeds(self, num_samples: int) -> list[SeedSpec]:
         """
         Generate stratified seed specifications.
 
@@ -127,11 +162,6 @@ class SeedGenerator:
 
         # Get all base categories
         all_categories = list(PRICE_RANGES.keys())
-
-        # Calculate samples per base category
-        # Note: IT_HARDWARE maps to 2 GL accounts based on price threshold
-        num_gl_accounts = len(GLAccount)
-        base_samples_per_gl = num_samples // num_gl_accounts
 
         # Track samples per GL account
         gl_counts = Counter()
@@ -188,7 +218,7 @@ class SeedGenerator:
 
     def generate_counterfactual_pairs(
         self, num_pairs: int
-    ) -> List[tuple[SeedSpec, SeedSpec]]:
+    ) -> list[tuple[SeedSpec, SeedSpec]]:
         """
         Generate counterfactual pairs for robustness testing.
 
@@ -203,15 +233,16 @@ class SeedGenerator:
             flip_type = "price" if i % 2 == 0 else "department"
 
             if flip_type == "price":
-                # Price flip around 800 EUR threshold
+                # Price flip around the IT hardware capitalization threshold.
                 category = "IT_HARDWARE"
+                threshold = _it_threshold()
                 department = self._sample_department(category)
                 vendor = self.rng.choice(VENDOR_VARIANTS)
                 language = self.rng.choice(list(Language))
                 text_style = self.rng.choice(list(TextStyle))
 
-                # Below threshold
-                price_low = self.np_rng.uniform(700.0, 795.0)
+                # Below threshold (700-795 EUR when the rule is 800)
+                price_low = self.np_rng.uniform(0.875 * threshold, 0.99375 * threshold)
                 gl_low = get_gl_account(category, price_low)
 
                 seed_low = SeedSpec(
@@ -225,8 +256,8 @@ class SeedGenerator:
                     gl_account=gl_low,
                 )
 
-                # Above threshold (same item, different price)
-                price_high = self.np_rng.uniform(805.0, 900.0)
+                # Above threshold (805-900 EUR when the rule is 800)
+                price_high = self.np_rng.uniform(1.00625 * threshold, 1.125 * threshold)
                 gl_high = get_gl_account(category, price_high)
 
                 seed_high = SeedSpec(
@@ -282,7 +313,7 @@ class SeedGenerator:
         return pairs
 
 
-def print_distribution_summary(seeds: List[SeedSpec]) -> None:
+def print_distribution_summary(seeds: list[SeedSpec]) -> None:
     """Print summary statistics of seed distribution."""
     from rich.console import Console
     from rich.table import Table
@@ -304,18 +335,22 @@ def print_distribution_summary(seeds: List[SeedSpec]) -> None:
 
     console.print(table)
 
-    # IT hardware price distribution around threshold
+    # IT hardware price distribution around the rule boundary
     it_seeds = [s for s in seeds if s.base_category == "IT_HARDWARE"]
     if it_seeds:
-        below_800 = sum(1 for s in it_seeds if s.net_amount_eur < 800)
-        around_threshold = sum(1 for s in it_seeds if 650 <= s.net_amount_eur <= 950)
+        threshold = _it_threshold()
+        below_threshold = sum(1 for s in it_seeds if s.net_amount_eur < threshold)
+        around_threshold = sum(
+            1 for s in it_seeds if 0.8125 * threshold <= s.net_amount_eur <= 1.1875 * threshold
+        )
 
         console.print("\n[bold]IT Hardware Price Distribution:[/bold]")
         console.print(f"  Total IT hardware seeds: {len(it_seeds)}")
-        console.print(f"  Below 800 EUR (GL_6220): {below_800}")
-        console.print(f"  >= 800 EUR (GL_1400): {len(it_seeds) - below_800}")
+        console.print(f"  Below {threshold:g} EUR: {below_threshold}")
+        console.print(f"  >= {threshold:g} EUR: {len(it_seeds) - below_threshold}")
         console.print(
-            f"  In threshold region (650-950 EUR): {around_threshold} "
+            f"  In threshold region "
+            f"({0.8125 * threshold:g}-{1.1875 * threshold:g} EUR): {around_threshold} "
             f"({(around_threshold/len(it_seeds)*100):.1f}%)"
         )
 
@@ -332,19 +367,19 @@ def print_distribution_summary(seeds: List[SeedSpec]) -> None:
 
     # Department distribution
     dept_counts = Counter(seed.department for seed in seeds)
-    console.print(f"\n[bold]Department Distribution:[/bold]")
+    console.print("\n[bold]Department Distribution:[/bold]")
     for dept in sorted(dept_counts.keys(), key=lambda x: x.value):
         console.print(f"  {dept.value}: {dept_counts[dept]}")
 
     # Language distribution
     lang_counts = Counter(seed.language for seed in seeds)
-    console.print(f"\n[bold]Language Distribution:[/bold]")
+    console.print("\n[bold]Language Distribution:[/bold]")
     for lang in sorted(lang_counts.keys(), key=lambda x: x.value):
         console.print(f"  {lang.value}: {lang_counts[lang]}")
 
     # Text style distribution
     style_counts = Counter(seed.text_style for seed in seeds)
-    console.print(f"\n[bold]Text Style Distribution:[/bold]")
+    console.print("\n[bold]Text Style Distribution:[/bold]")
     for style in sorted(style_counts.keys(), key=lambda x: x.value):
         console.print(f"  {style.value}: {style_counts[style]}")
 

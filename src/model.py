@@ -6,14 +6,14 @@ Fuses text embeddings (vendor, description) with continuous numerical features
 to learn GL account classification without hardcoded business rules.
 """
 
-from pathlib import Path
-from typing import Optional
 import json
 import math
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
 from transformers import AutoConfig, AutoModel, AutoTokenizer, PreTrainedModel
 from transformers.modeling_outputs import SequenceClassifierOutput
 
@@ -114,22 +114,28 @@ class ERPClassifierModel(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        # When loading from checkpoint, don't re-download the encoder
-        kwargs['load_pretrained_encoder'] = False
+        # A local checkpoint already contains the encoder in its state dict, so
+        # rebuilding it from config is enough. For a Hugging Face repo id, keep
+        # the default and load the pretrained encoder weights instead of
+        # silently starting from random initialization.
+        path = Path(str(pretrained_model_name_or_path))
+        if path.exists() and "load_pretrained_encoder" not in kwargs:
+            kwargs["load_pretrained_encoder"] = False
         return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
     def __init__(
         self,
         config,
-        model_name: Optional[str] = None,
-        num_depts: Optional[int] = None,
-        num_continuous: Optional[int] = None,
-        class_weights: Optional[torch.Tensor] = None,
-        use_class_weights: Optional[bool] = None,
+        model_name: str | None = None,
+        num_depts: int | None = None,
+        num_continuous: int | None = None,
+        class_weights: torch.Tensor | None = None,
+        use_class_weights: bool | None = None,
         load_pretrained_encoder: bool = True,
-        num_encoding: Optional[str] = None,
-        numeric_bin_edges: Optional[list] = None,
-        numeric_bin_feature_idx: Optional[int] = None,
+        num_encoding: str | None = None,
+        numeric_bin_edges: list | None = None,
+        numeric_bin_feature_idx: int | None = None,
+        max_length: int | None = None,
     ):
         super().__init__(config)
 
@@ -137,6 +143,10 @@ class ERPClassifierModel(PreTrainedModel):
         self.model_name = model_name or getattr(config, "base_model_name", "distilbert-base-uncased")
         self.num_depts = num_depts or getattr(config, "num_depts", 10)
         self.num_continuous = num_continuous or getattr(config, "num_continuous", 2)
+        # `max_length` is reserved for generation parameters by transformers,
+        # so persist the encoder's truncation length under a distinct name.
+        self.max_seq_length = int(max_length or getattr(config, "max_seq_length", 128))
+        config.max_seq_length = self.max_seq_length
         # `num_labels` is a property derived from id2label in transformers 5.x, and
         # older checkpoints were saved with a literal null. Fall back to id2label
         # rather than crashing on nn.Linear(..., None).
@@ -291,8 +301,8 @@ class ERPClassifierModel(PreTrainedModel):
         attention_mask: torch.Tensor,
         num_features: torch.Tensor,
         dept_id: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        sample_weight: Optional[torch.Tensor] = None,
+        labels: torch.Tensor | None = None,
+        sample_weight: torch.Tensor | None = None,
         return_dict: bool = True,
     ):
         out = self._encode_and_fuse(
@@ -311,7 +321,7 @@ class ERPClassifierModel(PreTrainedModel):
             # training instead uses per-sample weights that restore the source prior.
             weight = self.class_weights if self.use_class_weights else None
             if sample_weight is not None:
-                per_sample = F.cross_entropy(
+                per_sample = functional.cross_entropy(
                     logits.view(-1, self.num_labels),
                     labels.view(-1).long(),
                     weight=weight,
@@ -321,7 +331,7 @@ class ERPClassifierModel(PreTrainedModel):
                 w = sample_weight.view(-1).float()
                 loss = (per_sample * w).sum() / w.sum().clamp_min(1e-6)
             else:
-                loss = F.cross_entropy(
+                loss = functional.cross_entropy(
                     logits.view(-1, self.num_labels),
                     labels.view(-1).long(),
                     weight=weight,
@@ -348,6 +358,7 @@ class ERPClassifierModel(PreTrainedModel):
         dept_id: torch.Tensor,
     ) -> dict:
         """Run inference and return probabilities alongside FiLM modulation diagnostics."""
+        self.eval()  # diagnostics are inference-only; disable modality dropout
         out = self._encode_and_fuse(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -395,12 +406,14 @@ def load_model(model_dir: Path, device: torch.device):
 @torch.no_grad()
 def predict_probs(model, tokenizer, texts, num_features, dept_ids, device, batch_size: int = 64) -> np.ndarray:
     """Softmax probabilities for parallel lists of inputs."""
+    model.eval()  # disable modality dropout if the caller left the model in train mode
+    max_length = int(getattr(getattr(model, "config", None), "max_seq_length", 128))
     out = []
     for i in range(0, len(texts), batch_size):
         enc = tokenizer(
             texts[i:i + batch_size],
             truncation=True,
-            max_length=128,
+            max_length=max_length,
             padding=True,
             return_tensors="pt",
         ).to(device)

@@ -49,6 +49,10 @@ FALLBACK_MODEL_DIRS = (
 DEFAULT_CONFIDENCE_CUTOFF = 0.90
 
 
+class ModelLoadError(RuntimeError):
+    """Raised when a checkpoint or one of its preprocessing artifacts is missing/invalid."""
+
+
 def parse_sweep_spec(spec: str) -> list[float]:
     """Parse a sweep specification ('start:stop:step' or 'a,b,c') into EUR amounts."""
     spec = spec.strip()
@@ -108,6 +112,10 @@ class ERPClassifier:
             for candidate in FALLBACK_MODEL_DIRS:
                 cand_path = Path(candidate)
                 if cand_path.exists():
+                    console.print(
+                        f"[yellow]Warning: {requested} not found; "
+                        f"falling back to {cand_path}.[/yellow]"
+                    )
                     return cand_path
         return requested
 
@@ -119,12 +127,11 @@ class ERPClassifier:
         """
         path = self.model_dir / name
         if not path.exists():
-            console.print(f"[red]Error: required artifact not found: {path}[/red]")
-            console.print(
-                "[yellow]The checkpoint must ship with its own scaler/vocabulary. "
-                "Retrain with train.py, which copies them next to the weights.[/yellow]"
+            raise ModelLoadError(
+                f"required artifact not found: {path}. The checkpoint must ship "
+                "with its own scaler/vocabulary. Retrain with train.py, which "
+                "copies them next to the weights."
             )
-            sys.exit(1)
         return path
 
     def _load_model(self):
@@ -132,19 +139,24 @@ class ERPClassifier:
         console.print(f"\n[bold cyan]Loading ERP Classifier ({self.model_dir})...[/bold cyan]")
 
         if not self.model_dir.exists():
-            console.print(f"[red]Error: Model directory not found: {self.model_dir}[/red]")
-            console.print("[yellow]Available models:[/yellow]")
+            available = []
             models_dir = Path("models")
             if models_dir.exists():
-                for model_path in sorted(models_dir.iterdir()):
-                    if model_path.is_dir():
-                        console.print(f"  - {model_path}")
-            console.print(
-                f"\n[yellow]Or train a new model:[/yellow] "
-                f"python train.py --train-data output/multimodal/train_multimodal.jsonl "
-                f"--val-data output/multimodal/val_multimodal.jsonl --output-dir {self.model_dir}"
+                available = [
+                    str(p) for p in sorted(models_dir.iterdir()) if p.is_dir()
+                ]
+            available_text = (
+                "\nAvailable models:\n  " + "\n  ".join(available)
+                if available
+                else ""
             )
-            sys.exit(1)
+            raise ModelLoadError(
+                f"Model directory not found: {self.model_dir}{available_text}\n"
+                f"Train a model with: python train.py "
+                f"--train-data output/multimodal/train_multimodal.jsonl "
+                f"--val-data output/multimodal/val_multimodal.jsonl "
+                f"--output-dir {self.model_dir}"
+            )
 
         with console.status("[bold green]Loading tokenizer..."):
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
@@ -169,11 +181,23 @@ class ERPClassifier:
             self.model.to(self.device).eval()
 
         if self.model.num_labels != len(ID2LABEL):
-            console.print(
-                f"[red]Error: checkpoint has {self.model.num_labels} labels, "
-                f"but the code expects {len(ID2LABEL)}.[/red]"
+            raise ModelLoadError(
+                f"Checkpoint has {self.model.num_labels} labels, "
+                f"but the code expects {len(ID2LABEL)}."
             )
-            sys.exit(1)
+        if (
+            len(self.scaler_mean) != self.model.num_continuous
+            or len(self.scaler_scale) != self.model.num_continuous
+        ):
+            raise ModelLoadError(
+                f"Scaler has {len(self.scaler_mean)} features, but the model "
+                f"expects {self.model.num_continuous}."
+            )
+        if max(self.dept_vocab.values(), default=0) >= self.model.num_depts:
+            raise ModelLoadError(
+                f"Department vocabulary has id {max(self.dept_vocab.values())}, "
+                f"but the model only has {self.model.num_depts} embeddings."
+            )
 
         console.print(f"[bold green]Model loaded on {self.device}.[/bold green]\n")
 
@@ -197,7 +221,7 @@ class ERPClassifier:
         encoding = self.tokenizer(
             text,
             truncation=True,
-            max_length=128,
+            max_length=getattr(self.model, "max_seq_length", 128),
             padding='max_length',
             return_tensors='pt',
         )
@@ -251,7 +275,7 @@ def display_prediction(result: dict, show_all: bool = False):
 
     if routing == "AUTO_POST":
         color = "green"
-        routing_line = f"[bold green]AUTO-POST[/bold green] (confidence >= {cutoff:.0%} validation cutoff)"
+        routing_line = f"[bold green]AUTO-POST[/bold green] (confidence >= {cutoff:.0%} configured cutoff)"
     elif confidence >= 0.70:
         color = "yellow"
         routing_line = f"[bold yellow]MANUAL REVIEW[/bold yellow] (below {cutoff:.0%} auto-post cutoff)"
@@ -544,7 +568,11 @@ Examples:
         console.print(f"[red]Error: --cutoff must be between 0.0 and 1.0, got {args.cutoff}[/red]")
         sys.exit(1)
 
-    classifier = ERPClassifier(args.model_dir, confidence_cutoff=args.cutoff)
+    try:
+        classifier = ERPClassifier(args.model_dir, confidence_cutoff=args.cutoff)
+    except ModelLoadError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        sys.exit(1)
 
     if args.sweep is not None:
         try:

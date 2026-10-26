@@ -16,29 +16,29 @@ Usage:
 import argparse
 import json
 import shutil
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+from rich.console import Console
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.utils.class_weight import compute_class_weight
 from torch.optim import AdamW
-from pathlib import Path
-from typing import List, Dict
-from dataclasses import dataclass
-from collections import Counter
-
+from torch.utils.data import Dataset
 from transformers import (
-    AutoTokenizer,
     AutoConfig,
-    TrainingArguments,
+    AutoTokenizer,
     Trainer,
+    TrainingArguments,
     set_seed,
 )
 from transformers.trainer_utils import EvalPrediction
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from sklearn.utils.class_weight import compute_class_weight
-from rich.console import Console
 
+from src.config import ID2LABEL, MODEL_CONFIG, NUM_LABELS
 from src.model import ERPClassifierModel
-from src.config import NUM_LABELS, ID2LABEL, MODEL_CONFIG
 
 console = Console()
 
@@ -91,9 +91,10 @@ class MultimodalDataCollator:
 
     pad_token_id: int = 0
 
-    def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
+    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
         max_len = max(len(f['input_ids']) for f in features)
-        pad = lambda t, v: torch.nn.functional.pad(t, (0, max_len - len(t)), value=v)
+        def pad(t, v):
+            return torch.nn.functional.pad(t, (0, max_len - len(t)), value=v)
         batch = {
             'input_ids': torch.stack([pad(f['input_ids'], self.pad_token_id) for f in features]),
             'attention_mask': torch.stack([pad(f['attention_mask'], 0) for f in features]),
@@ -105,7 +106,7 @@ class MultimodalDataCollator:
         return batch
 
 
-def describe_weights(train_records: List[Dict], num_labels: int):
+def describe_weights(train_records: list[dict], num_labels: int):
     """Print raw counts and effective (sample-weighted) class mass."""
     raw = Counter(r['label'] for r in train_records)
     mass = Counter()
@@ -120,7 +121,7 @@ def describe_weights(train_records: List[Dict], num_labels: int):
     return raw, mass
 
 
-def compute_class_weights(train_records: List[Dict], num_labels: int) -> torch.Tensor:
+def compute_class_weights(train_records: list[dict], num_labels: int) -> torch.Tensor:
     """Balanced class weights, capped at 5.0 so tiny classes do not explode."""
     labels = [r['label'] for r in train_records]
     unique_classes = np.unique(labels)
@@ -137,7 +138,76 @@ def compute_class_weights(train_records: List[Dict], num_labels: int) -> torch.T
     return torch.tensor(weights, dtype=torch.float32)
 
 
-def compute_metrics(pred: EvalPrediction) -> Dict:
+def no_decay_param_ids(model: nn.Module) -> set[int]:
+    """Parameter ids that should not receive weight decay.
+
+    Uses module type for LayerNorm rather than name substrings, so the
+    LayerNorms inside ``num_proj`` and ``classifier`` are covered too.
+    """
+    no_decay: set[int] = set()
+    for module in model.modules():
+        if isinstance(module, nn.LayerNorm):
+            if module.weight is not None:
+                no_decay.add(id(module.weight))
+            if module.bias is not None:
+                no_decay.add(id(module.bias))
+    for name, param in model.named_parameters():
+        if name.endswith("bias"):
+            no_decay.add(id(param))
+    return no_decay
+
+
+def build_optimizer_groups(
+    model: nn.Module,
+    encoder_lr: float,
+    tabular_lr: float,
+    weight_decay: float = MODEL_CONFIG["weight_decay"],
+) -> list[dict]:
+    """Differential-LR parameter groups with no decay on biases or LayerNorms."""
+    no_decay = no_decay_param_ids(model)
+    encoder_named = list(model.encoder.named_parameters())
+    encoder_ids = {id(p) for _, p in encoder_named}
+    tabular_named = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if id(param) not in encoder_ids and param.requires_grad
+    ]
+
+    return [
+        {
+            "params": [
+                p for _, p in encoder_named
+                if p.requires_grad and id(p) not in no_decay
+            ],
+            "lr": encoder_lr,
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": [
+                p for _, p in encoder_named
+                if p.requires_grad and id(p) in no_decay
+            ],
+            "lr": encoder_lr,
+            "weight_decay": 0.0,
+        },
+        {
+            "params": [
+                p for _, p in tabular_named if id(p) not in no_decay
+            ],
+            "lr": tabular_lr,
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": [
+                p for _, p in tabular_named if id(p) in no_decay
+            ],
+            "lr": tabular_lr,
+            "weight_decay": 0.0,
+        },
+    ]
+
+
+def compute_metrics(pred: EvalPrediction) -> dict:
     """Compute accuracy, macro F1 (for model selection), and weighted F1."""
     labels = pred.label_ids
     preds = pred.predictions if isinstance(pred.predictions, np.ndarray) else pred.predictions[0]
@@ -194,6 +264,7 @@ def main():
     console.print(f"  Epochs: {args.num_epochs}")
     console.print(f"  Batch size: {args.batch_size}")
     console.print(f"  Learning rate: {args.learning_rate}")
+    console.print(f"  Max sequence length: {args.max_length}")
 
     set_seed(args.seed)
 
@@ -241,6 +312,7 @@ def main():
     # label names and drop the stale literal so the saved config is unambiguous.
     config.id2label = {i: ID2LABEL[i] for i in range(NUM_LABELS)}
     config.label2id = {v: k for k, v in config.id2label.items()}
+    config.max_seq_length = args.max_length
     config.__dict__.pop("num_labels", None)
 
     bin_edges = None
@@ -260,6 +332,7 @@ def main():
         num_continuous=2,  # z_score(net_amount), log1p(net_amount)
         class_weights=class_weights,
         use_class_weights=use_class_weights,
+        max_length=args.max_length,
     )
 
     # transformers 5.x derives `num_labels` from id2label but `to_dict()` reads the
@@ -267,9 +340,9 @@ def main():
     # literal null. Pin it for a self-describing config.
     model.config.__dict__['num_labels'] = NUM_LABELS
 
-    console.print(f"  Architecture:")
+    console.print("  Architecture:")
     console.print(f"    Text encoder: {args.model_name}")
-    console.print(f"    Numerical branch: [2] → [64]")
+    console.print("    Numerical branch: [2] → [64]")
     console.print(f"    Department branch: [{num_depts}] → [32]")
     console.print(f"    Fusion: [768 + 64 + 32] → [256] → [128] → [{NUM_LABELS}]")
 
@@ -282,8 +355,10 @@ def main():
     # Training arguments
     output_dir = Path(args.output_dir)
 
-    # Calculate warmup steps from MODEL_CONFIG warmup_ratio (default 15%)
-    total_steps = (len(train_dataset) // args.batch_size) * args.num_epochs
+    # Calculate warmup steps from MODEL_CONFIG warmup_ratio (default 15%).
+    # Trainer uses ceil(len / batch_size) steps per epoch (last batch included).
+    steps_per_epoch = (len(train_dataset) + args.batch_size - 1) // args.batch_size
+    total_steps = steps_per_epoch * args.num_epochs
     warmup_steps = int(total_steps * MODEL_CONFIG["warmup_ratio"])
     weight_decay = MODEL_CONFIG["weight_decay"]
 
@@ -312,45 +387,16 @@ def main():
 
     # Differential learning rates with no weight decay on bias / LayerNorm
     def optimizer_factory(model):
-        no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "dept_norm.weight", "text_norm.weight"]
-
-        encoder_named = list(model.encoder.named_parameters())
-        encoder_ids = {id(p) for _, p in encoder_named}
-        tabular_named = [
-            (n, p) for n, p in model.named_parameters()
-            if id(p) not in encoder_ids and p.requires_grad
-        ]
-
-        optimizer_grouped_parameters = [
-            # 1. Encoder with weight decay
-            {
-                "params": [p for n, p in encoder_named if not any(nd in n for nd in no_decay)],
-                "lr": args.learning_rate,
-                "weight_decay": 0.01,
-            },
-            # 2. Encoder without weight decay (biases & LayerNorm)
-            {
-                "params": [p for n, p in encoder_named if any(nd in n for nd in no_decay)],
-                "lr": args.learning_rate,
-                "weight_decay": 0.0,
-            },
-            # 3. Tabular & Fusion heads with weight decay
-            {
-                "params": [p for n, p in tabular_named if not any(nd in n for nd in no_decay)],
-                "lr": args.tabular_lr,
-                "weight_decay": 0.01,
-            },
-            # 4. Tabular & Fusion heads without weight decay (critical for threshold biases!)
-            {
-                "params": [p for n, p in tabular_named if any(nd in n for nd in no_decay)],
-                "lr": args.tabular_lr,
-                "weight_decay": 0.0,
-            },
-        ]
+        optimizer_grouped_parameters = build_optimizer_groups(
+            model, args.learning_rate, args.tabular_lr, weight_decay=weight_decay
+        )
 
         console.print("\nDifferential learning rates configured:")
-        console.print(f"  Encoder (DistilBERT): {args.learning_rate}")
-        console.print(f"  Tabular & Fusion heads: {args.tabular_lr} (0.0 weight decay on threshold biases)")
+        console.print(f"  Encoder: {args.learning_rate}")
+        console.print(
+            f"  Tabular & Fusion heads: {args.tabular_lr} "
+            "(0.0 weight decay on biases and LayerNorms)"
+        )
 
         return AdamW(optimizer_grouped_parameters)
 
@@ -369,7 +415,7 @@ def main():
 
     # Train
     console.print("\nStarting training...\n")
-    train_result = trainer.train()
+    trainer.train()
 
     # Save
     console.print(f"\nSaving model to {output_dir}")
@@ -395,8 +441,10 @@ def main():
     with open(summary_path, 'w') as f:
         json.dump({
             'model_name': args.model_name,
+            'seed': args.seed,
             'num_epochs': args.num_epochs,
             'batch_size': args.batch_size,
+            'max_length': args.max_length,
             'learning_rate': args.learning_rate,
             'train_samples': len(train_dataset),
             'val_samples': len(val_dataset),

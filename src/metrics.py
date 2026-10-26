@@ -1,7 +1,7 @@
 """Small numpy-only metric helpers shared by evaluation and baseline scripts."""
 
 import math
-from typing import Dict, List, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -46,7 +46,7 @@ def cluster_bootstrap_ci(
     return (float(lo), float(hi))
 
 
-def cross_threshold(amounts, p_hi, threshold: float = 0.5) -> Dict:
+def cross_threshold(amounts, p_hi, threshold: float = 0.5) -> dict:
     """First upward crossing of `threshold`, interpolated in log-amount.
 
     Returns the crossing amount (or None), whether the curve is censored (never
@@ -89,7 +89,7 @@ def sweep_case_metrics(
     tight_rel: float = 0.0625,
     step_tol_rel: float = DEFAULT_STEP_TOL_REL,
     mono_tol: float = 0.05,
-) -> Dict:
+) -> dict:
     """Metrics for one fixed-text amount sweep.
 
     `p_hi` is the probability renormalised over the two accounts either side of
@@ -126,12 +126,12 @@ def sweep_case_metrics(
 
 
 def aggregate_sweep(
-    cases: List[Dict],
+    cases: list[dict],
     *,
     mono_tol: float = 0.05,
     step_tol_rel: float = DEFAULT_STEP_TOL_REL,
     tight_rel: float = 0.0625,
-) -> Dict:
+) -> dict:
     """Aggregate per-case sweep metrics without conditioning on flip count.
 
     Crossing error is computed for every case that has a crossing; the coverage

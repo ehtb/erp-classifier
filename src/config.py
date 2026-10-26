@@ -15,7 +15,6 @@ import operator
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Dict, Tuple
 
 
 class GLAccount(str, Enum):
@@ -159,7 +158,7 @@ VENDOR_VARIANTS = [
 
 
 # Category -> Department affinity matrix (realistic business context)
-CATEGORY_DEPT_AFFINITY: Dict[str, List[Department]] = {
+CATEGORY_DEPT_AFFINITY: dict[str, list[Department]] = {
     "IT_HARDWARE": [Department.IT_OPS, Department.ENG],
     "OFFICE_CONSUMABLES": [Department.IT_OPS, Department.ENG, Department.MARKETING, Department.HR],
     "FACILITY_PANTRY": [Department.FACILITIES, Department.HR],
@@ -171,7 +170,7 @@ CATEGORY_DEPT_AFFINITY: Dict[str, List[Department]] = {
 
 
 # Price ranges per category (EUR)
-PRICE_RANGES: Dict[str, Tuple[float, float]] = {
+PRICE_RANGES: dict[str, tuple[float, float]] = {
     "IT_HARDWARE": (45.0, 2500.0),  # Wide range to cover threshold testing
     "OFFICE_CONSUMABLES": (5.0, 150.0),
     "FACILITY_PANTRY": (10.0, 300.0),
@@ -182,16 +181,23 @@ PRICE_RANGES: Dict[str, Tuple[float, float]] = {
 }
 
 
-# Price sampling weights. We oversample around 800 EUR for IT hardware to test
-# whether the model learned the threshold. Without oversampling, too few training
-# examples land near the boundary to verify it reliably.
-def get_price_distribution_weights(category: str, num_bins: int = 20) -> List[float]:
+# Price sampling weights. We oversample around the IT hardware threshold to test
+# whether the model learned the rule. Without oversampling, too few training
+# examples land near the boundary to verify it reliably. The threshold is passed
+# in by the caller, which discovers it from the accounting rules.
+def get_price_distribution_weights(
+    category: str,
+    num_bins: int = 20,
+    *,
+    threshold: float,
+) -> list[float]:
     """
-    Generate price sampling weights with oversampling for IT hardware threshold region.
+    Generate price sampling weights with oversampling around a rule threshold.
 
-    For IT_HARDWARE: sample 5x as often between 650-950 EUR (centered on the 800 EUR
-    threshold). This gives us enough examples near the boundary to check whether the
-    model makes the right call.
+    For IT_HARDWARE: sample 5x as often in the core region around `threshold`
+    (default rule: 650-950 EUR, i.e. +/-18.75%), and 2x in the wider band
+    (+/-31.25%). The threshold is passed in by the caller, which discovers it
+    from the accounting rules, so changing the rule changes the sampling region.
 
     For other categories: sample uniformly across the price range.
     """
@@ -199,6 +205,8 @@ def get_price_distribution_weights(category: str, num_bins: int = 20) -> List[fl
         return [1.0] * num_bins
 
     min_price, max_price = PRICE_RANGES[category]
+    core_lo, core_hi = 0.8125 * threshold, 1.1875 * threshold
+    wide_lo, wide_hi = 0.6875 * threshold, 1.3125 * threshold
     bin_size = (max_price - min_price) / num_bins
 
     weights = []
@@ -207,10 +215,9 @@ def get_price_distribution_weights(category: str, num_bins: int = 20) -> List[fl
         bin_end = bin_start + bin_size
         bin_mid = (bin_start + bin_end) / 2
 
-        # Oversample near the 800 EUR threshold
-        if 650 <= bin_mid <= 950:
+        if core_lo <= bin_mid <= core_hi:
             weights.append(5.0)  # 5x in the core region
-        elif 550 <= bin_mid <= 1050:
+        elif wide_lo <= bin_mid <= wide_hi:
             weights.append(2.0)  # 2x in the wider band
         else:
             weights.append(1.0)  # Normal sampling elsewhere
@@ -227,11 +234,11 @@ NUM_LABELS = len(GLAccount)
 
 # Model configuration (defaults matched to train.py)
 MODEL_CONFIG = {
-    "base_model": "distilbert-base-uncased",  # Lightweight, good for small datasets
+    "base_model": "distilbert-base-multilingual-cased",  # 104 languages incl. EN/DE/NL, keeps casing and accents
     # Alternative options:
-    # "answerdotai/ModernBERT-base"  # 2x faster than DeBERTa, state-of-the-art (Dec 2024)
-    # "microsoft/mdeberta-v3-base"  # Best accuracy, slower
-    # "bert-base-uncased"            # Established baseline
+    # "microsoft/mdeberta-v3-base"   # Best accuracy, ~280M params, slower
+    # "xlm-roberta-base"             # Multilingual, ~280M params
+    # "distilbert-base-uncased"      # English only, previous default (v0.5.3 and earlier)
     "max_length": 128,
     "batch_size": 16,
     "learning_rate": 3e-5,

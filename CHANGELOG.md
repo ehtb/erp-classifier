@@ -4,6 +4,37 @@ All notable changes to the ERP Classifier project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.6.0] - 2026-10-26
+
+**In short:** The default text model is now `distilbert-base-multilingual-cased` instead of the English-only `distilbert-base-uncased`, so English, German and Dutch descriptions work out of the box. Test accuracy for the default design rose from 96.5% ± 0.6% to 98.8% ± 0.9% (3 seeds), the €800 switch still happens once and lands about 0.5% from 800, and the model is about twice as large (135M parameters) and trains in about 6 minutes per seed instead of 4.
+
+### Changed
+- **Default backbone** (`src/config.py`). `MODEL_CONFIG["base_model"]` is `distilbert-base-multilingual-cased`. No model code changed, since the encoder loads through `AutoModel` and `AutoTokenizer`. Use `--model-name distilbert-base-uncased` to reproduce v0.5.3.
+- **Ablations, evaluation and baselines retrained and rerun** on the new backbone (A–F, weight ablation, default checkpoint, ensemble). The TF-IDF baselines don't depend on the backbone and are unchanged.
+- **Docs**: README FAQ and `docs/architecture.md` section 4 ("Critical notes and known limitations") added, and claims that overstated what the model guarantees were softened (monotonicity is a bias, not a guarantee; FiLM does not start at exactly 1.0x).
+
+### Fixed
+- **Data generation** (`src/verbalizer.py`, `src/seed_generator.py`, `src/critic.py`). Loading seeds from JSON no longer crashes on string enum fields, `Title:`/`Description:` prefixed responses are parsed instead of replaced with placeholders, and one failed batch/API call no longer aborts a run.
+- **Bedrock Claude** (`src/llm_client.py`). Claude requests now use the Anthropic Messages API body with `anthropic_version` and parse the top-level `content` response; Nova keeps its existing shape. OpenAI/Bedrock clients now have finite timeouts and SDK retries.
+- **Training** (`train.py`). Weight decay is now disabled for all biases and LayerNorms, including the LayerNorms inside `num_proj` and `classifier`; warmup steps account for the final partial batch and the optimizer uses `MODEL_CONFIG["weight_decay"]`.
+- **Checkpoint metadata** (`src/model.py`, `train.py`, `classify_erp.py`). `--max-length` is persisted as `max_seq_length` and used by inference and evaluation instead of a hard-coded 128.
+- **Dataset builder** (`src/multimodal_dataset.py`). Refitting a builder no longer accumulates department ids, and identical generic titles are grouped even when all their tokens are too common for the rare-token index.
+- **CLI/library** (`classify_erp.py`). Missing artifacts/checkpoints raise `ModelLoadError` instead of calling `sys.exit` from the library; department/scaler sizes are validated, fallback checkpoints emit a warning, and the routing label no longer calls the hand-picked 0.90 cutoff a “validation” cutoff.
+- **Legacy HF builder** (`src/dataset_builder.py`). The text no longer contains `[DEPT]`/`[NET_AMT]`, prices are scrubbed, and `seed_id=0` is preserved.
+- **Tests/CI**: added verbalizer, critic, Bedrock, optimizer, near-duplicate, max-length, and missing-artifact tests; `ruff check .` is clean and `.github/workflows/ci.yml` runs lint and tests.
+- **Docs**: synced validation count (142), sweep accuracy (95.3%), first-crossing figures (0.5%/15.4%), training time, and source anchors.
+
+### Results (3 seeds, same split)
+| Config | Test acc | Sweep point acc | Tolerance step | One flip | Non-monotone | First crossing |
+|---|---|---|---|---|---|---|
+| D PLE + CF | 98.8% ± 0.9% | 0.953 | 100% | 100% | 0% | 0.5% [0.4, 0.7] |
+| F D + price band token | 99.1% ± 0.9% | 0.989 | 100% | 100% | 0% | 0.0% |
+| B PLE, no CF | 97.4% ± 0.3% | 0.763 | 11% | 87% | 0% | 15.4% |
+
+- Confidence routing at 0.90 (default checkpoint): 134 of 141 test lines auto-posted with no errors, 7 sent to review including all 3 errors. ECE is 0.035.
+- The 99%-on-validation rule in `scripts/evaluate.py` now selects 0.40, because validation accuracy is already above 99%. The CLI and demo keep 0.90.
+- A one-off hand probe of 15 German and Dutch lines got 12 right, and all 3 misses scored below 0.90. It is not part of the repo.
+
 ## [0.5.0] - 2026-10-25
 
 **In short:** We tried giving the model a head start on the 800 EUR line: a first step labels each price as "below" or "above" 800, and the classifier reads that label along with the description. The switch from operating expense to capital expense now lands on 800 (to within the sweep's grid resolution) instead of about 0.6% away, while overall accuracy stays within noise (95.7% vs 96.5%). Because the first step uses the same rule that creates the labels, this shows the upper bound when the boundary is known ahead of time. We also added a CLI `--sweep` table, confidence routing output, a side-by-side boundary sweep plot, and a Gradio browser demo (`app.py`).

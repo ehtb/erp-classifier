@@ -1,14 +1,14 @@
 | Config | Seeds | Test acc (seed sd) | Macro F1 | ECE | Real near-boundary |
 |---|---|---|---|---|---|
-| C_balanced | 1 | 94.3% ± 0.0% | 0.943 | 0.042 | 8/8 |
-| D_balanced | 1 | 95.7% ± 0.0% | 0.959 | 0.054 | 8/8 |
-| D_none | 3 | 96.9% ± 0.3% | 0.970 | 0.047 | 8/8, 8/8, 8/8 |
+| C_balanced | 1 | 96.5% ± 0.0% | 0.962 | 0.052 | 8/8 |
+| D_balanced | 1 | 98.6% ± 0.0% | 0.985 | 0.044 | 8/8 |
+| D_none | 3 | 97.9% ± 1.5% | 0.978 | 0.039 | 8/8, 8/8, 8/8 |
 
 | Config | Sweep point | Strict | Tight ±6.25% | Tolerance step | One flip | Non-monotone | Max neg. step | First-crossing error (seed range) | Coverage |
 |---|---|---|---|---|---|---|---|---|---|
-| C_balanced | 0.976 | 0.958 | 0.902 | 100% | 100% | 39% | 0.279 | 0.0% [0.0, 0.0] | 100% |
-| D_balanced | 0.937 | 0.930 | 0.742 | 100% | 100% | 0% | 0.001 | 0.9% [0.9, 0.9] | 100% |
-| D_none | 0.947 | 0.947 | 0.783 | 100% | 100% | 0% | 0.002 | 0.6% [0.2, 1.1] | 100% |
+| C_balanced | 0.969 | 0.962 | 0.882 | 82% | 82% | 100% | 0.578 | 0.1% [0.1, 0.1] | 100% |
+| D_balanced | 0.948 | 0.948 | 0.786 | 100% | 100% | 0% | 0.000 | 0.7% [0.7, 0.7] | 100% |
+| D_none | 0.954 | 0.954 | 0.810 | 100% | 100% | 0% | 0.001 | 0.6% [0.4, 0.8] | 100% |
 
 Notes:
 - `±` is the training-seed standard deviation on one fixed test set, not test-set uncertainty.

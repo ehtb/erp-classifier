@@ -19,7 +19,12 @@ import numpy as np  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from classify_erp import DEFAULT_CONFIDENCE_CUTOFF, DEFAULT_MODEL_DIR, ERPClassifier  # noqa: E402
+from classify_erp import (  # noqa: E402
+    DEFAULT_CONFIDENCE_CUTOFF,
+    DEFAULT_MODEL_DIR,
+    ERPClassifier,
+    ModelLoadError,
+)
 from src.boundaries import price_band_edges  # noqa: E402
 from src.config import LABEL2ID  # noqa: E402
 from src.metrics import DEFAULT_STEP_TOL_REL  # noqa: E402
@@ -252,7 +257,10 @@ def main():
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
 
-    classifier = ERPClassifier(args.model_dir, confidence_cutoff=args.cutoff)
+    try:
+        classifier = ERPClassifier(args.model_dir, confidence_cutoff=args.cutoff)
+    except ModelLoadError as exc:
+        raise SystemExit(f"Error: {exc}") from exc
     demo = build_demo(classifier)
     demo.launch(server_port=args.port, share=args.share)
 

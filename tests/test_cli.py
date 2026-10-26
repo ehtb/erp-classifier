@@ -9,13 +9,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import torch
-from transformers import DistilBertConfig, DistilBertTokenizer
+from transformers import AutoTokenizer, DistilBertConfig, DistilBertTokenizer
 
-from classify_erp import ERPClassifier, parse_sweep_spec
+from classify_erp import ERPClassifier, ModelLoadError, parse_sweep_spec
 from demo.app import evaluate_transaction
 from scripts.evaluate import plot_boundary_sweep
 from src.config import ID2LABEL, NUM_LABELS
-from src.model import ERPClassifierModel, get_device
+from src.model import ERPClassifierModel, get_device, predict_probs
 
 
 def _tiny_model(num_encoding: str = "ple") -> ERPClassifierModel:
@@ -184,3 +184,27 @@ def test_hermetic_demo_evaluation_on_active_device_and_cutoff_validation(tmp_pat
 
     assert "[PRICE_BAND] 0 [VENDOR] Amazon Services Europe" in diag_below
     assert "[PRICE_BAND] 1 [VENDOR] Amazon Services Europe" in diag_above
+
+
+def test_missing_artifact_raises_instead_of_exiting(tmp_path):
+    ckpt_dir = _write_tiny_checkpoint(tmp_path / "missing-scaler")
+    (ckpt_dir / "scaler.json").unlink()
+
+    with pytest.raises(ModelLoadError, match="scaler.json"):
+        ERPClassifier(model_dir=str(ckpt_dir), device="cpu")
+
+
+def test_predict_probs_forces_eval_mode(tmp_path):
+    ckpt_dir = _write_tiny_checkpoint(tmp_path / "predict-eval")
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+    model = ERPClassifierModel.from_pretrained(ckpt_dir)
+    model.train()
+
+    texts = ["[VENDOR] Amazon Services Europe [DESC] Dell UltraSharp Monitor"]
+    feats = np.array([[500.0, 5.5]], dtype=np.float32)
+
+    first = predict_probs(model, tokenizer, texts, feats, [1], "cpu", batch_size=1)
+    second = predict_probs(model, tokenizer, texts, feats, [1], "cpu", batch_size=1)
+
+    assert not model.training
+    assert np.allclose(first, second)

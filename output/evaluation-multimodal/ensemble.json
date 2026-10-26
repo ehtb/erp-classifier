@@ -5,133 +5,128 @@
     "models/ablation/D_ple_quantile_cf/seed44"
   ],
   "n_models": 3,
+  "price_band_edges": null,
   "n_test": 141,
-  "accuracy": 0.9716312056737588,
+  "accuracy": 1.0,
   "accuracy_ci95": [
-    0.9293304990335695,
-    0.9889139832146244
+    0.9734772330601154,
+    1.0
   ],
-  "mean_seed_agreement": 0.9834515366430261,
+  "mean_seed_agreement": 0.988179669030733,
   "risk_coverage": [
     {
       "cutoff": 0.4,
-      "coverage": 1.0,
-      "accuracy": 0.9716312056737588,
-      "n_accepted": 141
+      "coverage": 0.9929078014184397,
+      "accuracy": 1.0,
+      "n_accepted": 140
     },
     {
       "cutoff": 0.45,
       "coverage": 0.9929078014184397,
-      "accuracy": 0.9714285714285714,
+      "accuracy": 1.0,
       "n_accepted": 140
     },
     {
       "cutoff": 0.5,
-      "coverage": 0.9858156028368794,
-      "accuracy": 0.9784172661870504,
-      "n_accepted": 139
+      "coverage": 0.9929078014184397,
+      "accuracy": 1.0,
+      "n_accepted": 140
     },
     {
       "cutoff": 0.55,
-      "coverage": 0.9787234042553191,
-      "accuracy": 0.9855072463768116,
-      "n_accepted": 138
+      "coverage": 0.9929078014184397,
+      "accuracy": 1.0,
+      "n_accepted": 140
     },
     {
       "cutoff": 0.6,
-      "coverage": 0.9716312056737588,
-      "accuracy": 0.9854014598540146,
-      "n_accepted": 137
+      "coverage": 0.9858156028368794,
+      "accuracy": 1.0,
+      "n_accepted": 139
     },
     {
       "cutoff": 0.65,
-      "coverage": 0.9716312056737588,
-      "accuracy": 0.9854014598540146,
-      "n_accepted": 137
+      "coverage": 0.9858156028368794,
+      "accuracy": 1.0,
+      "n_accepted": 139
     },
     {
       "cutoff": 0.7,
-      "coverage": 0.9574468085106383,
-      "accuracy": 0.9851851851851852,
-      "n_accepted": 135
+      "coverage": 0.9858156028368794,
+      "accuracy": 1.0,
+      "n_accepted": 139
     },
     {
       "cutoff": 0.75,
-      "coverage": 0.9432624113475178,
-      "accuracy": 0.9924812030075187,
-      "n_accepted": 133
+      "coverage": 0.9645390070921985,
+      "accuracy": 1.0,
+      "n_accepted": 136
     },
     {
       "cutoff": 0.8,
+      "coverage": 0.950354609929078,
+      "accuracy": 1.0,
+      "n_accepted": 134
+    },
+    {
+      "cutoff": 0.85,
+      "coverage": 0.9432624113475178,
+      "accuracy": 1.0,
+      "n_accepted": 133
+    },
+    {
+      "cutoff": 0.9,
       "coverage": 0.9290780141843972,
       "accuracy": 1.0,
       "n_accepted": 131
     },
     {
-      "cutoff": 0.85,
-      "coverage": 0.9219858156028369,
-      "accuracy": 1.0,
-      "n_accepted": 130
-    },
-    {
-      "cutoff": 0.9,
-      "coverage": 0.9148936170212766,
-      "accuracy": 1.0,
-      "n_accepted": 129
-    },
-    {
       "cutoff": 0.95,
-      "coverage": 0.851063829787234,
+      "coverage": 0.900709219858156,
       "accuracy": 1.0,
-      "n_accepted": 120
+      "n_accepted": 127
     }
   ],
   "cutoff_for_99pct": {
-    "cutoff": 0.75,
-    "coverage": 0.9432624113475178,
-    "accuracy": 0.9924812030075187,
-    "n_accepted": 133
+    "cutoff": 0.4,
+    "coverage": 0.9929078014184397,
+    "accuracy": 1.0,
+    "n_accepted": 140
   },
   "agreement_coverage": [
     {
-      "min_agreement": 0.33,
-      "coverage": 1.0,
-      "accuracy": 0.9716312056737588,
-      "n_accepted": 141
-    },
-    {
       "min_agreement": 0.67,
-      "coverage": 0.9574468085106383,
-      "accuracy": 0.9777777777777777,
-      "n_accepted": 135
+      "coverage": 0.9645390070921985,
+      "accuracy": 1.0,
+      "n_accepted": 136
     },
     {
       "min_agreement": 1.0,
-      "coverage": 0.9574468085106383,
-      "accuracy": 0.9777777777777777,
-      "n_accepted": 135
+      "coverage": 0.9645390070921985,
+      "accuracy": 1.0,
+      "n_accepted": 136
     }
   ],
   "sweep": {
     "cases": 33,
     "one_flip_fraction": 1.0,
-    "median_crossing_rel_error": 0.005708837638208592,
+    "median_crossing_rel_error": 0.005136224587014198,
     "crossing_coverage": 1.0,
-    "corr_disagreement_vs_crossing_error": 0.0005207375504738443,
+    "corr_disagreement_vs_crossing_error": -0.28736675937079764,
     "in_band": {
       "n": 363,
-      "error_rate": 0.3168044077134986,
-      "mean_agreement": 0.9338842975206612
+      "error_rate": 0.27823691460055094,
+      "mean_agreement": 0.9118457300275482
     },
     "accepted_all_seeds_agree_in_band": {
-      "n": 296,
-      "error_rate": 0.2702702702702703,
+      "n": 281,
+      "error_rate": 0.2526690391459075,
       "mean_agreement": 1.0
     },
     "rejected_disagreement_in_band": {
-      "n": 67,
-      "error_rate": 0.5223880597014925,
-      "mean_agreement": 0.6417910447761193
+      "n": 82,
+      "error_rate": 0.36585365853658536,
+      "mean_agreement": 0.6097560975609755
     }
   }
 }
