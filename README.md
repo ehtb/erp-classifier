@@ -37,7 +37,7 @@ On accuracy the Jev-like model is about two points ahead (98.8% vs 96.5%, roughl
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Accuracy                 | 95.0% on text alone, 96.5% with amount bins and department                                                                                         | 98.8% (97.9% for the default checkpoint)                                                                                                                                                                                            |
 | The €800 cut-off         | Text alone never switches. With amount bins it switches within 1.3% of €800                                                                        | Switches once, within 0.5% of €800, and scores 95.3% across the price sweep vs 92.6%                                                                                                                                                |
-| Messy, multilingual text | Only matches whole words seen in training, so German Bürostuhl and English office chair are unrelated, and a typo or truncated SAP title is a miss | A multilingual pretrained language model (104 languages, including English, German and Dutch) covers synonyms across languages, typos and truncated SAP text. It is weaker on Dutch than German in a quick hand check (see the FAQ) |
+| Messy, multilingual text | Only matches whole words seen in training, so German Bürostuhl and English office chair are unrelated, and a typo or truncated SAP title is a miss | A multilingual pretrained language model (104 languages, including English, German and Dutch) covers synonyms across languages, typos and truncated SAP text. |
 | Cost                     | Cheapest to train and run on a plain CPU                                                                                                           | 135M parameters. Trains in about 6 minutes on an Apple Silicon laptop, predicts in milliseconds on a CPU, and has no per-call fees like a hosted LLM                                                                                |
 | Confidence scores        | Not measured here                                                                                                                                  | Calibrated (ECE 0.035), which is what the 90% auto-post cutoff relies on                                                                                                                                                            |
 
@@ -45,23 +45,23 @@ On accuracy the Jev-like model is about two points ahead (98.8% vs 96.5%, roughl
 
 This is a demo on synthetic data, and some of its results are weaker than the headline numbers suggest. The questions below are the ones a skeptical reader should ask. The technical detail is in [docs/architecture.md](docs/architecture.md#4-critical-notes-and-known-limitations).
 
-**Why not write `if amount >= 800`? **
+**Why not write `if amount >= 800`?**
 
 The rule only applies to IT hardware, and an invoice doesn't say what category it is. It has a vendor, a messy description, a department and an amount. To use the rule you would first need a classifier that finds the category, then the rule on top. This model does both in one pass. The optional two-stage price band mode (config F) is closer to that setup, and it scores best on the price sweep.
 
-**Did the model discover the €800 threshold? **
+**Did the model discover the €800 threshold?**
 
 No. It was taught it. The training set includes counterfactual copies of IT items priced on both sides of €800, generated from the rule in `src/config.py`, and the price bin edges are fit on that augmented data. Without the counterfactuals the first-crossing error goes from 0.5% to 15.4% (configs B and D in the [ablations](docs/building.md#results)), even though B scores 97.4% on plain test accuracy. That makes this rule distillation, not rule discovery. It is useful when you know the rule and want one model that applies it only to the right items. It does not show that a model can find an unknown rule from data.
 
-**The text-only baseline gets 95%. Is the data too easy? **
+**The text-only baseline gets 95%. Is the data too easy?**
 
 Partly, yes. The synthetic generator asks for cheap-sounding items below €800 (keyboard, USB hub) and premium ones above it (4K monitor, docking station), so the wording leaks the label. Real invoices won't be that tidy. A zero-shot filter also drops generated rows where it disagrees with the target label, which removes hard cases before the split, so accuracy and calibration are probably optimistic. The fixed-text price sweep is the more honest test, because it holds the description constant and only moves the price.
 
-**Is the test set big enough? **
+**Is the test set big enough?**
 
 Not to rank models that are close together. It has 141 items, so one item is 0.7 points, and the gap between the Jev-like model (98.8%), the best traditional baseline (96.5%) and the text-only baseline (95.0%) is two to five items, and the seed-to-seed spread alone is about one item. Only 8 test items sit near €800. The sweep adds 33 IT descriptions × 70 prices to cover that gap, and the 0.90 cutoff was picked using a handful of validation errors.
 
-**Is the price response guaranteed to be monotone? **
+**Is the price response guaranteed to be monotone?**
 
 No. The 16 price ramps are monotone, but the layers after them are not constrained, so monotone behavior is a strong bias and not a proof. On the 33 IT test items the largest drop in probability as price rises is 0.03% for the default checkpoint and 0.2% at worst across the three seeds (config C, with the sine/cosine encoder, drops up to 20%). The "0% non-monotone" figure ignores drops under 5%.
 
